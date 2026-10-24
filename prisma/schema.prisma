@@ -1,0 +1,88 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id          String   @id @default(cuid())
+  username    String   @unique
+  displayName String
+  role        String
+  createdAt   DateTime @default(now())
+
+  auditEvents       AuditEvent[]
+  approvalRequests  ApprovalRequest[] @relation("ApprovalRequester")
+  approvalDecisions ApprovalRequest[] @relation("ApprovalDecider")
+  refunds           Refund[]          @relation("RefundRequester")
+}
+
+// Append-only by convention: platform code only ever creates or reads these
+// rows — there is intentionally no update/delete path for audit events.
+model AuditEvent {
+  id         String   @id @default(cuid())
+  actorId    String
+  action     String
+  entityType String
+  entityId   String
+  before     String? // JSON snapshot
+  after      String? // JSON snapshot
+  createdAt  DateTime @default(now())
+
+  actor User @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+model ApprovalRequest {
+  id            String    @id @default(cuid())
+  entityType    String // e.g. "refund" — decides which tool callback runs
+  entityId      String
+  requiredRole  String
+  reason        String
+  status        String    @default("pending") // pending | approved | rejected
+  requesterId   String
+  decidedById   String?
+  decisionNote  String?
+  createdAt     DateTime  @default(now())
+  decidedAt     DateTime?
+
+  requester User  @relation("ApprovalRequester", fields: [requesterId], references: [id])
+  decidedBy User? @relation("ApprovalDecider", fields: [decidedById], references: [id])
+
+  @@index([status, requiredRole])
+}
+
+model Transaction {
+  id          String   @id @default(cuid())
+  externalId  String   @unique
+  merchant    String
+  cardholder  String
+  amountCents Int
+  currency    String   @default("USD")
+  status      String   @default("settled")
+  createdAt   DateTime @default(now())
+
+  refunds Refund[]
+}
+
+model Refund {
+  id                String   @id @default(cuid())
+  transactionId     String
+  amountCents       Int
+  reason            String
+  status            String   @default("requested") // requested -> approved/rejected -> executed/failed
+  requestedById     String
+  approvalRequestId String?  @unique
+  paymentRefundId   String?
+  failureReason     String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  transaction Transaction @relation(fields: [transactionId], references: [id])
+  requestedBy User        @relation("RefundRequester", fields: [requestedById], references: [id])
+}
