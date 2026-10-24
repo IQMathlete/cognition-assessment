@@ -1,8 +1,12 @@
 import { db } from "@/platform/db";
 import { withAudit } from "@/platform/audit";
-import { createApprovalRequest, decideApproval } from "@/platform/approvals";
+import {
+  createApprovalRequest,
+  decideApproval,
+  registerApprovalHooks,
+} from "@/platform/approvals";
 import { requirePermission } from "@/platform/rbac";
-import { NotFoundError, ValidationError } from "@/platform/errors";
+import { ConflictError, NotFoundError, ValidationError } from "@/platform/errors";
 import { MockPaymentsClient, type PaymentsClient } from "./payments";
 
 export const SMALL_REFUND_LIMIT_CENTS = 25000; // $250
@@ -14,6 +18,18 @@ export function requiredRoleForRefund(amountCents: number): string {
     ? "support_lead"
     : "finance_approver";
 }
+
+// Statuses that reserve money against a transaction. Rejected and failed
+// refunds free their amount for a retry.
+const COMMITTED_STATUSES = ["requested", "approved", "executed"] as const;
+
+const REFUND_TRANSITIONS: Record<string, readonly string[]> = {
+  requested: ["approved", "rejected", "failed"],
+  approved: ["executed", "failed"],
+  rejected: [],
+  executed: [],
+  failed: [],
+};
 
 let paymentsClient: PaymentsClient = new MockPaymentsClient();
 
@@ -57,9 +73,33 @@ export async function requestRefund(
       where: { id: input.transactionId },
     });
     if (!transaction) throw new NotFoundError("Transaction not found.");
+    if (transaction.status !== "settled") {
+      throw new ValidationError(
+        "Only settled transactions can be refunded.",
+      );
+    }
     if (input.amountCents > transaction.amountCents) {
       throw new ValidationError(
         "Refund cannot exceed the original transaction amount.",
+      );
+    }
+
+    // Over-refund guard: outstanding refunds (requested/approved/executed)
+    // reserve money against the transaction, so several smaller refunds
+    // cannot together exceed what was paid.
+    const committed =
+      (
+        await tx.refund.aggregate({
+          _sum: { amountCents: true },
+          where: {
+            transactionId: transaction.id,
+            status: { in: [...COMMITTED_STATUSES] },
+          },
+        })
+      )._sum.amountCents ?? 0;
+    if (committed + input.amountCents > transaction.amountCents) {
+      throw new ValidationError(
+        "Refunds against this transaction already reserve its full amount.",
       );
     }
 
@@ -135,6 +175,11 @@ async function setRefundStatus(
     const before = await tx.refund.findUniqueOrThrow({
       where: { id: refundId },
     });
+    if (!REFUND_TRANSITIONS[before.status]?.includes(to)) {
+      throw new ConflictError(
+        `Refund cannot transition ${before.status} -> ${to}.`,
+      );
+    }
     const after = await tx.refund.update({
       where: { id: refundId },
       data: { status: to, ...extra },
@@ -159,23 +204,96 @@ export async function onRefundApproved(request: {
   decidedById: string | null;
 }) {
   const actorId = request.decidedById ?? "system";
-  const refund = await db.refund.findUniqueOrThrow({
-    where: { id: request.entityId },
-    include: { transaction: true },
+
+  // Approve inside a single transaction that re-checks the refundable
+  // balance: requests committed after this refund was created may have
+  // consumed it, so the reservation is made atomically with the status
+  // change and over-refund is impossible even under concurrent approvals.
+  const refund = await withAudit(actorId, async (tx) => {
+    const before = await tx.refund.findUniqueOrThrow({
+      where: { id: request.entityId },
+      include: { transaction: true },
+    });
+    if (!REFUND_TRANSITIONS[before.status]?.includes("approved")) {
+      throw new ConflictError(
+        `Refund cannot transition ${before.status} -> approved.`,
+      );
+    }
+
+    const committedByOthers =
+      (
+        await tx.refund.aggregate({
+          _sum: { amountCents: true },
+          where: {
+            transactionId: before.transactionId,
+            status: { in: ["approved", "executed"] },
+            id: { not: before.id },
+          },
+        })
+      )._sum.amountCents ?? 0;
+
+    if (
+      before.amountCents >
+      before.transaction.amountCents - committedByOthers
+    ) {
+      const failed = await tx.refund.update({
+        where: { id: before.id },
+        data: {
+          status: "failed",
+          failureReason:
+            "Refund would exceed the transaction's remaining refundable amount.",
+        },
+      });
+      return {
+        value: { refund: failed, transaction: before.transaction, proceed: false },
+        audit: {
+          action: "refund.status",
+          entityType: "refund",
+          entityId: before.id,
+          before,
+          after: failed,
+        },
+      };
+    }
+
+    const approved = await tx.refund.update({
+      where: { id: before.id },
+      data: { status: "approved" },
+    });
+    return {
+      value: { refund: approved, transaction: before.transaction, proceed: true },
+      audit: {
+        action: "refund.status",
+        entityType: "refund",
+        entityId: before.id,
+        before,
+        after: approved,
+      },
+    };
   });
 
-  await setRefundStatus(actorId, refund.id, "approved");
+  if (!refund.proceed) return;
 
-  const result = await paymentsClient.refund({
-    transactionExternalId: refund.transaction.externalId,
-    amountCents: refund.amountCents,
-    currency: refund.transaction.currency,
-    idempotencyKey: refund.id,
-  });
+  let result;
+  try {
+    result = await paymentsClient.refund({
+      transactionExternalId: refund.transaction.externalId,
+      amountCents: refund.refund.amountCents,
+      currency: refund.transaction.currency,
+      idempotencyKey: refund.refund.id,
+    });
+  } catch (e) {
+    result = {
+      ok: false as const,
+      failureReason: `Payments client error: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    };
+  }
 
   await setRefundStatus(
     actorId,
-    refund.id,
+    refund.refund.id,
     result.ok ? "executed" : "failed",
     result.ok
       ? { paymentRefundId: result.paymentRefundId }
@@ -197,3 +315,11 @@ export async function listRefunds(user: Actor) {
     orderBy: { createdAt: "desc" },
   });
 }
+
+// Plug into the approvals primitive. Living in this module (not the barrel
+// file) means any import path that can reach the service also registers the
+// hooks — an approval can never land without its execution callbacks.
+registerApprovalHooks("refund", {
+  onApproved: onRefundApproved,
+  onRejected: onRefundRejected,
+});

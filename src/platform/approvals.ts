@@ -1,7 +1,8 @@
 import type { ApprovalRequest } from "@prisma/client";
 import { db, type Tx } from "./db";
 import { ConflictError, ForbiddenError, NotFoundError } from "./errors";
-import { withAudit } from "./audit";
+import { recordAudit, withAudit } from "./audit";
+import { requirePermission } from "./rbac";
 
 export interface ApprovalHooks {
   /** Runs after an approval request transitions to "approved". */
@@ -41,11 +42,14 @@ export async function createApprovalRequest(
 
 export async function decideApproval(input: {
   requestId: string;
-  decider: { id: string; role: string };
+  decider: { id: string; role: string } | null;
   approve: boolean;
   note?: string;
 }): Promise<ApprovalRequest> {
   const { requestId, decider, approve, note } = input;
+  if (!decider) {
+    throw new ForbiddenError("You must be signed in to decide requests.");
+  }
 
   const decided = await withAudit(decider.id, async (tx) => {
     const request = await tx.approvalRequest.findUnique({
@@ -87,19 +91,56 @@ export async function decideApproval(input: {
   });
 
   // Tool callbacks run after the decision commits: they may call external
-  // systems (payments) which should not hold a DB transaction open.
+  // systems (payments) which should not hold a DB transaction open. A failing
+  // hook must not corrupt the recorded decision — it is logged and surfaced
+  // as an audit entry rather than rolling anything back.
   const toolHooks = hooks.get(decided.entityType);
-  if (decided.status === "approved") {
-    await toolHooks?.onApproved?.(decided);
-  } else if (decided.status === "rejected") {
-    await toolHooks?.onRejected?.(decided);
+  const hook =
+    decided.status === "approved"
+      ? toolHooks?.onApproved
+      : decided.status === "rejected"
+        ? toolHooks?.onRejected
+        : undefined;
+  if (decided.status !== "pending" && !toolHooks) {
+    console.warn(
+      `No approval hooks registered for entityType "${decided.entityType}".`,
+    );
+  }
+  if (hook) {
+    try {
+      await hook(decided);
+    } catch (e) {
+      console.error(
+        `Approval hook for "${decided.entityType}" failed:`,
+        e instanceof Error ? e.message : e,
+      );
+      await recordStandaloneAudit(decider.id, {
+        action: "approval.hook_failed",
+        entityType: "approval_request",
+        entityId: decided.id,
+        after: {
+          error: e instanceof Error ? e.message : String(e),
+          status: decided.status,
+        },
+      });
+    }
   }
   return decided;
 }
 
-export function listPendingApprovalsFor(role: string) {
+async function recordStandaloneAudit(
+  actorId: string,
+  entry: Parameters<typeof recordAudit>[2],
+) {
+  await db.$transaction((tx) => recordAudit(tx, actorId, entry));
+}
+
+export function listPendingApprovalsFor(
+  user: { id: string; role: string } | null,
+) {
+  requirePermission(user, "refunds:approve");
   return db.approvalRequest.findMany({
-    where: { status: "pending", requiredRole: role },
+    where: { status: "pending", requiredRole: user.role },
     include: { requester: true },
     orderBy: { createdAt: "desc" },
   });

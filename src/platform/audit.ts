@@ -1,4 +1,4 @@
-import { db, type Tx } from "./db";
+import { auditGuardsReady, db, type Tx } from "./db";
 
 export interface AuditEntry {
   action: string;
@@ -48,6 +48,7 @@ export async function withAudit<T>(
   actorId: string,
   work: (tx: Tx) => Promise<{ value: T; audit: AuditEntry | AuditEntry[] }>,
 ): Promise<T> {
+  await auditGuardsReady();
   return db.$transaction(async (tx) => {
     const { value, audit } = await work(tx);
     await recordAudit(tx, actorId, audit);
