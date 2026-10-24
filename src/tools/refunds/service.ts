@@ -341,9 +341,21 @@ export async function onRefundApproved(request: {
 }
 
 export async function onRefundRejected(request: {
+  id?: string;
   entityId: string;
   decidedById: string | null;
 }) {
+  // Same linkage rule as the approve path: a crafted rejection must not
+  // move a refund that belongs to a different approval request.
+  const refund = await db.refund.findUnique({
+    where: { id: request.entityId },
+    select: { approvalRequestId: true },
+  });
+  if (refund && refund.approvalRequestId !== request.id) {
+    throw new HookRefusalError(
+      "Approval request is not linked to this refund.",
+    );
+  }
   await setRefundStatus(request.decidedById ?? "system", request.entityId, "rejected");
 }
 
