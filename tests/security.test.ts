@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { db } from "@/platform/db";
+import { recordAudit } from "@/platform/audit";
 import { ForbiddenError, ValidationError } from "@/platform/errors";
 import { decideApproval, listPendingApprovalsFor } from "@/platform/approvals";
 import "@/tools/refunds"; // registers approval hooks
@@ -41,33 +42,50 @@ describe("over-refund", () => {
 
   it("fails, rather than executes, an approval whose balance was consumed", async () => {
     const txn = await seedTransaction(25000, "txn_race");
-    // Two pending refunds created directly (bypasses request-time guard,
-    // e.g. rows created before the guard existed).
-    const mkRefund = async (cents: number) => {
-      const refund = await db.refund.create({
-        data: {
-          transactionId: txn.id,
-          amountCents: cents,
-          reason: "race",
-          requestedById: users.alice.id,
-          status: "requested",
-        },
+    // Two pending refunds with a complete request audit trail but created
+    // outside requestRefund — e.g. requests that slipped past the aggregate
+    // cap in a race. The approval-time balance recheck is the backstop this
+    // test exercises.
+    const mkRefund = async (cents: number) =>
+      db.$transaction(async (tx) => {
+        const refund = await tx.refund.create({
+          data: {
+            transactionId: txn.id,
+            amountCents: cents,
+            reason: "race",
+            requestedById: users.alice.id,
+            status: "requested",
+          },
+        });
+        const approval = await tx.approvalRequest.create({
+          data: {
+            requesterId: users.alice.id,
+            requiredRole: "support_lead",
+            entityType: "refund",
+            entityId: refund.id,
+            reason: "race",
+          },
+        });
+        const linked = await tx.refund.update({
+          where: { id: refund.id },
+          data: { approvalRequestId: approval.id },
+        });
+        await recordAudit(tx, users.alice.id, [
+          {
+            action: "refund.requested",
+            entityType: "refund",
+            entityId: refund.id,
+            after: linked,
+          },
+          {
+            action: "approval.requested",
+            entityType: "approval_request",
+            entityId: approval.id,
+            after: approval,
+          },
+        ]);
+        return { refund: linked, approval };
       });
-      const approval = await db.approvalRequest.create({
-        data: {
-          requesterId: users.alice.id,
-          requiredRole: "support_lead",
-          entityType: "refund",
-          entityId: refund.id,
-          reason: "race",
-        },
-      });
-      await db.refund.update({
-        where: { id: refund.id },
-        data: { approvalRequestId: approval.id },
-      });
-      return { refund, approval };
-    };
     const a = await mkRefund(20000);
     const b = await mkRefund(20000);
 
@@ -133,18 +151,23 @@ describe("transaction + state-machine guards", () => {
         reason: "crafted",
       },
     });
-    // The decision is recorded, but the hook refuses to resurrect a terminal
-    // refund because the crafted request is not its linked approval; the
-    // refusal is itself audited.
-    await decideRefund(users.bob, {
-      approvalRequestId: approval.id,
-      approve: true,
-    });
+    // The refund is terminal — the crafted decision is rejected inside the
+    // decision transaction (nothing commits) and the failure is audited.
+    await expect(
+      decideRefund(users.bob, {
+        approvalRequestId: approval.id,
+        approve: true,
+      }),
+    ).rejects.toThrow();
     expect(
       (await db.refund.findUniqueOrThrow({ where: { id: refund.id } })).status,
     ).toBe("executed");
+    expect(
+      (await db.approvalRequest.findUniqueOrThrow({ where: { id: approval.id } }))
+        .status,
+    ).toBe("pending");
     const actions = (await db.auditEvent.findMany()).map((e) => e.action);
-    expect(actions).toContain("approval.execution_refused");
+    expect(actions).toContain("approval.decide_failed");
   });
 });
 

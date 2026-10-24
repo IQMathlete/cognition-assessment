@@ -376,10 +376,13 @@ describe("entity confusion and linkage", () => {
       requiredRole: "support_lead",
       entityId: refund.id,
     });
-    await decideRefund(users.bob, {
-      approvalRequestId: crafted.id,
-      approve: true,
-    });
+    // The refund is terminal — the decision itself is rejected in-transaction.
+    await expect(
+      decideRefund(users.bob, {
+        approvalRequestId: crafted.id,
+        approve: true,
+      }),
+    ).rejects.toThrow();
     expect(await refundStatus(refund.id)).toBe("rejected");
     expect(payments.calls).toHaveLength(0);
   });
@@ -400,10 +403,14 @@ describe("entity confusion and linkage", () => {
       approvalRequestId: refund.approvalRequestId!,
       approve: true,
     });
-    await decideRefund(users.bob, {
-      approvalRequestId: crafted.id,
-      approve: true,
-    });
+    // The refund already executed — the crafted decision is rejected
+    // in-transaction rather than recorded and refused.
+    await expect(
+      decideRefund(users.bob, {
+        approvalRequestId: crafted.id,
+        approve: true,
+      }),
+    ).rejects.toThrow();
     expect(payments.calls).toHaveLength(1);
   });
 

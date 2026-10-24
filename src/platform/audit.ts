@@ -1,4 +1,4 @@
-import { auditGuardsReady, db, type Tx } from "./db";
+import { AUDIT_GUARD_STATEMENTS, auditGuardsReady, db, type Tx } from "./db";
 
 export interface AuditEntry {
   action: string;
@@ -14,11 +14,18 @@ function toJson(value: unknown): string | null {
 
 // Writes audit rows inside an existing transaction. Internal to the platform —
 // callers should almost always use withAudit() instead.
+//
+// The append-only triggers are (re)installed inside this transaction: audit
+// writes outside withAudit (e.g. createApprovalRequest inside a caller's own
+// transaction) would otherwise leave the log unguarded on a fresh database.
 export async function recordAudit(
   tx: Tx,
   actorId: string,
   entries: AuditEntry | AuditEntry[],
 ): Promise<void> {
+  for (const stmt of AUDIT_GUARD_STATEMENTS) {
+    await tx.$executeRawUnsafe(stmt);
+  }
   for (const entry of Array.isArray(entries) ? entries : [entries]) {
     await tx.auditEvent.create({
       data: {

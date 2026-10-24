@@ -18,7 +18,7 @@ export type Tx = Parameters<Parameters<PrismaClient["$transaction"]>[0]>[0];
 // withAudit() before any audited write, so the guard is always in place
 // before the log can be touched. Tests drop the guards to reset the DB.
 
-const AUDIT_GUARD_STATEMENTS = [
+export const AUDIT_GUARD_STATEMENTS = [
   `CREATE TRIGGER IF NOT EXISTS audit_no_update
    BEFORE UPDATE ON "AuditEvent"
    BEGIN SELECT RAISE(ABORT, 'AuditEvent is append-only'); END`,

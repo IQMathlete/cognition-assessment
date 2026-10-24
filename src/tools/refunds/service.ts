@@ -379,11 +379,43 @@ export async function listRefunds(
 // entities from committing at all.
 registerApprovalHooks("refund", {
   requiredPermission: "refunds:approve",
+  // Runs inside the decision transaction: a request may only decide a refund
+  // that exists, is still awaiting its decision, is linked to THIS request,
+  // names the same requester, and came through the audited requestRefund path.
+  // Provenance checks throw HookRefusalError — the decision rolls back and is
+  // recorded as a failed decision rather than committed.
   validateEntity: async (tx: Tx, request) => {
     const refund = await tx.refund.findUnique({
       where: { id: request.entityId },
     });
     if (!refund) throw new NotFoundError("Refund not found.");
+    if (refund.status !== "requested") {
+      throw new ConflictError(
+        `Refund is no longer awaiting a decision (status: ${refund.status}).`,
+      );
+    }
+    if (refund.approvalRequestId !== request.id) {
+      throw new HookRefusalError(
+        "Approval request is not linked to this refund.",
+      );
+    }
+    if (refund.requestedById !== request.requesterId) {
+      throw new HookRefusalError(
+        "Approval requester does not match the refund requester.",
+      );
+    }
+    const requestedAudit = await tx.auditEvent.findFirst({
+      where: {
+        action: "refund.requested",
+        entityType: "refund",
+        entityId: refund.id,
+      },
+    });
+    if (!requestedAudit) {
+      throw new HookRefusalError(
+        "Refund was not created through the audited request path.",
+      );
+    }
   },
   onApproved: onRefundApproved,
   onRejected: onRefundRejected,

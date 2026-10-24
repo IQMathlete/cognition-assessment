@@ -8,6 +8,7 @@ import {
   ValidationError,
 } from "./errors";
 import { recordAudit, withAudit } from "./audit";
+import { resolveActor } from "./actor";
 import { hasPermission, isRole, requirePermission, type Permission } from "./rbac";
 
 export interface ApprovalHooks {
@@ -114,15 +115,20 @@ export async function decideApproval(input: {
       }
 
       const toolHooks = hooks.get(request.entityType);
+      if (!toolHooks) {
+        throw new NotFoundError(
+          `No approval hooks registered for entity type "${request.entityType}".`,
+        );
+      }
       if (
-        toolHooks?.requiredPermission &&
+        toolHooks.requiredPermission &&
         !hasPermission(deciderRow.role, toolHooks.requiredPermission)
       ) {
         throw new ForbiddenError(
           `Role "${deciderRow.role}" lacks permission "${toolHooks.requiredPermission}".`,
         );
       }
-      await toolHooks?.validateEntity?.(tx, request);
+      await toolHooks.validateEntity?.(tx, request);
 
       const status = approve ? "approved" : "rejected";
       const updated = await tx.approvalRequest.update({
@@ -157,6 +163,16 @@ export async function decideApproval(input: {
       });
     } catch (auditErr) {
       console.error("Failed to audit a rejected decision:", auditErr);
+    }
+    // A refusal (HookRefusalError) means the request cannot lawfully decide
+    // this entity — e.g. it is not the entity's linked request. The decision
+    // rolled back; resolve quietly with the still-pending request rather than
+    // surfacing it as an error, the same way a post-commit hook refusal is
+    // swallowed below.
+    if (e instanceof HookRefusalError) {
+      return db.approvalRequest.findUniqueOrThrow({
+        where: { id: requestId },
+      });
     }
     throw e;
   }
@@ -207,11 +223,12 @@ async function recordStandaloneAudit(
 export async function listPendingApprovalsFor(
   user: { id: string; role: string } | null,
 ) {
-  requirePermission(user, "refunds:approve");
-  const row = await db.user.findUnique({ where: { id: user.id } });
-  if (!row) throw new ForbiddenError("Unknown user.");
+  // Permission is checked against the stored role — the caller-supplied
+  // object is a claim, so the queue can never be entered under a forged one.
+  const actor = await resolveActor(user);
+  requirePermission(actor, "refunds:approve");
   return db.approvalRequest.findMany({
-    where: { status: "pending", requiredRole: row.role },
+    where: { status: "pending", requiredRole: actor!.role },
     include: { requester: true },
     orderBy: { createdAt: "desc" },
   });
