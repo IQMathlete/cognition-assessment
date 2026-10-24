@@ -19,9 +19,15 @@ export async function requestRefundAction(
 ): Promise<FormState> {
   const user = await requireUser();
   const transactionId = String(formData.get("transactionId") ?? "");
-  const amountDollars = Number(formData.get("amount") ?? "");
+  const amountRaw = String(formData.get("amount") ?? "").trim();
   const reason = String(formData.get("reason") ?? "");
-  const amountCents = Math.round(amountDollars * 100);
+
+  // Strict dollars parse — reject sub-cent precision ("10.005") and anything
+  // not a plain decimal rather than silently rounding to a different amount.
+  if (!/^\d+(\.\d{1,2})?$/.test(amountRaw)) {
+    return { error: "Enter a valid amount (up to 2 decimal places)." };
+  }
+  const amountCents = Math.round(Number(amountRaw) * 100);
 
   try {
     await requestRefund(user, { transactionId, amountCents, reason });

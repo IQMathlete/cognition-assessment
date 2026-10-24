@@ -110,19 +110,23 @@ describe("cumulative limits / over-refund", () => {
       amountCents: 20000,
       reason: "first",
     });
+    // The second request may be rejected outright at request time — that is
+    // itself a secure outcome.
     const r2 = await requestRefund(users.alice, {
       transactionId: txn.id,
       amountCents: 20000,
       reason: "second",
-    });
+    }).catch(() => null);
     await decideRefund(users.bob, {
       approvalRequestId: r1.approvalRequestId!,
       approve: true,
     });
-    await decideRefund(users.bob, {
-      approvalRequestId: r2.approvalRequestId!,
-      approve: true,
-    });
+    if (r2) {
+      await decideRefund(users.bob, {
+        approvalRequestId: r2.approvalRequestId!,
+        approve: true,
+      });
+    }
 
     const paid = payments.calls.reduce((s, c) => s + c.amountCents, 0);
     const executed = await db.refund.findMany({

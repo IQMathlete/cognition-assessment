@@ -25,3 +25,13 @@ export class ConflictError extends Error {
     this.name = "ConflictError";
   }
 }
+
+// Thrown by approval hooks when the decision does not apply to the entity —
+// e.g. a request is not the entity's linked approval. decideApproval records
+// the refusal and treats it as a handled outcome, not a system failure.
+export class HookRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HookRefusalError";
+  }
+}

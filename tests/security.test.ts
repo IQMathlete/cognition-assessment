@@ -133,8 +133,9 @@ describe("transaction + state-machine guards", () => {
         reason: "crafted",
       },
     });
-    // The decision is recorded, but the hook cannot resurrect a terminal
-    // refund; the failure is itself audited.
+    // The decision is recorded, but the hook refuses to resurrect a terminal
+    // refund because the crafted request is not its linked approval; the
+    // refusal is itself audited.
     await decideRefund(users.bob, {
       approvalRequestId: approval.id,
       approve: true,
@@ -143,14 +144,18 @@ describe("transaction + state-machine guards", () => {
       (await db.refund.findUniqueOrThrow({ where: { id: refund.id } })).status,
     ).toBe("executed");
     const actions = (await db.auditEvent.findMany()).map((e) => e.action);
-    expect(actions).toContain("approval.hook_failed");
+    expect(actions).toContain("approval.execution_refused");
   });
 });
 
 describe("approval queue access", () => {
   it("scopes the pending queue to the caller's own role", async () => {
-    expect(() => listPendingApprovalsFor(users.kai)).toThrow(ForbiddenError);
-    expect(() => listPendingApprovalsFor(users.erin)).toThrow(ForbiddenError);
+    await expect(listPendingApprovalsFor(users.kai)).rejects.toThrow(
+      ForbiddenError,
+    );
+    await expect(listPendingApprovalsFor(users.erin)).rejects.toThrow(
+      ForbiddenError,
+    );
 
     const txn = await seedTransaction(300000, "txn_q"); // finance route
     await requestRefund(users.alice, {
