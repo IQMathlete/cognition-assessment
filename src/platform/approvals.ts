@@ -222,13 +222,19 @@ async function recordStandaloneAudit(
 
 export async function listPendingApprovalsFor(
   user: { id: string; role: string } | null,
+  permission: Permission = "refunds:approve",
+  entityType?: string,
 ) {
   // Permission is checked against the stored role — the caller-supplied
   // object is a claim, so the queue can never be entered under a forged one.
   const actor = await resolveActor(user);
-  requirePermission(actor, "refunds:approve");
+  requirePermission(actor, permission);
   return db.approvalRequest.findMany({
-    where: { status: "pending", requiredRole: actor!.role },
+    where: {
+      status: "pending",
+      requiredRole: actor!.role,
+      ...(entityType ? { entityType } : {}),
+    },
     include: { requester: true },
     orderBy: { createdAt: "desc" },
   });

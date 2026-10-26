@@ -6,6 +6,7 @@ export const USERS = {
   fiona: "finance_approver",
   erin: "engineer",
   kai: "kyc_reviewer",
+  sam: "kyc_senior",
   adam: "platform_admin",
 } as const;
 
@@ -15,6 +16,8 @@ export async function resetDb() {
   await dropAuditGuards();
   await db.$transaction([
     db.auditEvent.deleteMany(),
+    db.kycReview.deleteMany(),
+    db.kycCase.deleteMany(),
     db.refund.deleteMany(),
     db.approvalRequest.deleteMany(),
     db.transaction.deleteMany(),
@@ -39,6 +42,22 @@ export async function seedTransaction(amountCents: number, externalId = "txn_t1"
       merchant: "Test Merchant",
       cardholder: "T. Tester",
       amountCents,
+    },
+  });
+}
+
+export async function seedCase(
+  riskScore: number,
+  externalId = "kyc_t1",
+  status = "pending",
+) {
+  return db.kycCase.create({
+    data: {
+      externalId,
+      applicant: "T. Applicant",
+      country: "US",
+      riskScore,
+      status,
     },
   });
 }

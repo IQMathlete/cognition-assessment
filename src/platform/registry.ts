@@ -24,6 +24,16 @@ export const toolRegistry: ToolRegistration[] = [
     description:
       "Search card transactions and request cardholder refunds, subject to approval.",
   },
+  {
+    slug: "kyc",
+    name: "KYC Review",
+    path: "/tools/kyc",
+    owner: "Compliance Operations",
+    sensitivity: "high",
+    requiredPermission: "kyc:read",
+    description:
+      "Submit applicant cases for KYC verdicts, subject to senior or financial-crimes approval.",
+  },
 ];
 
 export function toolsForRole(role: string): ToolRegistration[] {
