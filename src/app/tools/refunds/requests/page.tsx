@@ -29,13 +29,16 @@ export default async function RefundRequestsPage({
   // the full request history below.
   const canDecide = hasPermission(user.role, "refunds:approve");
   const [queue, all] = await Promise.all([
-    canDecide ? listPendingApprovalsFor(user) : Promise.resolve([]),
+    canDecide
+      ? listPendingApprovalsFor(user, "refunds:approve", "refund")
+      : Promise.resolve([]),
     listApprovals(),
   ]);
+  const refundRequests = all.filter((r) => r.entityType === "refund");
 
   // Attach refund + transaction context to each request row.
   const refunds = await db.refund.findMany({
-    where: { approvalRequestId: { in: all.map((a) => a.id) } },
+    where: { approvalRequestId: { in: refundRequests.map((a) => a.id) } },
     include: { transaction: true },
   });
   const refundByApprovalId = new Map(
@@ -104,7 +107,7 @@ export default async function RefundRequestsPage({
           </tr>
         </thead>
         <tbody>
-          {all.map((req) => (
+          {refundRequests.map((req) => (
             <tr key={req.id}>
               <td>
                 {req.entityType}{" "}
@@ -125,7 +128,7 @@ export default async function RefundRequestsPage({
               </td>
             </tr>
           ))}
-          {all.length === 0 && (
+          {refundRequests.length === 0 && (
             <tr>
               <td colSpan={5} className="subtle">
                 No approval requests yet.

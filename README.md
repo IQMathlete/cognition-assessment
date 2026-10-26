@@ -37,7 +37,8 @@ src/platform/          Shared platform — tools never talk to the DB without it
   approvals.ts         ApprovalRequest primitive + per-tool decision hooks
   registry.ts          Tool inventory (owner, sensitivity, required permission)
 src/tools/refunds/     Reference tool: search transactions, request refunds
-src/app/               App Router pages (login, /, /admin, /tools/refunds/*)
+src/tools/kyc/         KYC review queue (second governed tool)
+src/app/               App Router pages (login, /, /admin, /tools/*)
 ```
 
 - **Auth**: `AuthProvider` in `src/platform/auth/provider.ts`. `DevAuthProvider`
@@ -68,3 +69,16 @@ src/app/               App Router pages (login, /, /admin, /tools/refunds/*)
   `requested → approved/rejected → executed/failed`. Every transition is
   audited. Transactions whose `externalId` ends in `FAIL` are declined by the
   mock issuer to exercise the failed path.
+
+## KYC Review tool
+
+- `kyc_reviewer` searches applicant cases and requests a review with a
+  recommendation (`verify`/`reject`) and a required reason.
+- Risk score < 70 → `kyc_senior` approves; ≥ 70 → `finance_approver`
+  (standing in for a financial-crimes committee).
+- On approval a `ScreeningClient` (`src/tools/kyc/screening.ts`,
+  `MockScreeningClient` by default) files the verdict; statuses flow
+  `requested → approved/rejected → executed/failed`, and an executed verdict
+  updates the case (`pending → verified/rejected`) in the same transaction.
+  Cases whose `externalId` ends in `FAIL` are declined by the mock vendor.
+  A case can only have one active review at a time.

@@ -18,16 +18,24 @@ export type Permission =
   | "refunds:read"
   | "refunds:create"
   | "refunds:approve"
+  | "kyc:read"
+  | "kyc:create"
+  | "kyc:approve"
   | "admin:access";
 
 const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
   support_agent: ["refunds:read", "refunds:create"],
   support_lead: ["refunds:read", "refunds:create", "refunds:approve"],
-  finance_approver: ["refunds:read", "refunds:approve"],
+  finance_approver: [
+    "refunds:read",
+    "refunds:approve",
+    "kyc:read",
+    "kyc:approve",
+  ],
   engineer: ["refunds:read"],
-  kyc_reviewer: [],
-  kyc_senior: [],
-  platform_admin: ["admin:access", "refunds:read"],
+  kyc_reviewer: ["kyc:read", "kyc:create"],
+  kyc_senior: ["kyc:read", "kyc:create", "kyc:approve"],
+  platform_admin: ["admin:access", "refunds:read", "kyc:read"],
 };
 
 export function isRole(value: string): value is Role {
