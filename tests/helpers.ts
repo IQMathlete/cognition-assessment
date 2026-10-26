@@ -1,4 +1,4 @@
-import { db } from "@/platform/db";
+import { db, dropAuditGuards } from "@/platform/db";
 
 export const USERS = {
   alice: "support_agent",
@@ -10,6 +10,9 @@ export const USERS = {
 } as const;
 
 export async function resetDb() {
+  // Audit rows are append-only via DB triggers; tests lift the guards to
+  // reset, and the next withAudit() call reinstalls them.
+  await dropAuditGuards();
   await db.$transaction([
     db.auditEvent.deleteMany(),
     db.refund.deleteMany(),

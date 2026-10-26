@@ -1,9 +1,30 @@
 import type { ApprovalRequest } from "@prisma/client";
 import { db, type Tx } from "./db";
-import { ConflictError, ForbiddenError, NotFoundError } from "./errors";
-import { withAudit } from "./audit";
+import {
+  ConflictError,
+  ForbiddenError,
+  HookRefusalError,
+  NotFoundError,
+  ValidationError,
+} from "./errors";
+import { recordAudit, withAudit } from "./audit";
+import { resolveActor } from "./actor";
+import { hasPermission, isRole, requirePermission, type Permission } from "./rbac";
 
 export interface ApprovalHooks {
+  /**
+   * Permission a decider must hold for this entity type (e.g.
+   * "refunds:approve"). Checked against the decider's stored role — without
+   * it, a request crafted with a permission-less requiredRole could be
+   * decided by a role that should never approve anything.
+   */
+  requiredPermission?: Permission;
+  /**
+   * Runs inside the decision transaction, before the status is committed.
+   * Throwing rolls the whole decision back — use it to prove the target
+   * entity exists and is in a decidable state.
+   */
+  validateEntity?: (tx: Tx, request: ApprovalRequest) => Promise<void>;
   /** Runs after an approval request transitions to "approved". */
   onApproved?: (request: ApprovalRequest) => Promise<void>;
   /** Runs after an approval request transitions to "rejected". */
@@ -12,7 +33,7 @@ export interface ApprovalHooks {
 
 // Tools plug into the approvals primitive by registering hooks for the
 // entityType they request approvals over (e.g. the refunds tool registers
-// "refund"). Registered at module load; see src/tools/refunds/index.ts.
+// "refund" in src/tools/refunds/service.ts).
 const hooks = new Map<string, ApprovalHooks>();
 
 export function registerApprovalHooks(
@@ -24,7 +45,8 @@ export function registerApprovalHooks(
 
 /**
  * Creates a pending ApprovalRequest. Call inside the same transaction that
- * creates the entity needing approval so both commit together.
+ * creates the entity needing approval so both commit together; the request's
+ * creation is itself audited in that transaction.
  */
 export async function createApprovalRequest(
   tx: Tx,
@@ -36,70 +58,177 @@ export async function createApprovalRequest(
     reason: string;
   },
 ): Promise<ApprovalRequest> {
-  return tx.approvalRequest.create({ data: input });
+  if (!isRole(input.requiredRole)) {
+    throw new ValidationError(
+      `Cannot require an unknown role "${input.requiredRole}".`,
+    );
+  }
+  const request = await tx.approvalRequest.create({ data: input });
+  await recordAudit(tx, input.requesterId, {
+    action: "approval.requested",
+    entityType: "approval_request",
+    entityId: request.id,
+    after: request,
+  });
+  return request;
 }
 
 export async function decideApproval(input: {
   requestId: string;
-  decider: { id: string; role: string };
+  decider: { id: string; role: string } | null;
   approve: boolean;
   note?: string;
 }): Promise<ApprovalRequest> {
   const { requestId, decider, approve, note } = input;
+  if (!decider) {
+    throw new ForbiddenError("You must be signed in to decide requests.");
+  }
 
-  const decided = await withAudit(decider.id, async (tx) => {
-    const request = await tx.approvalRequest.findUnique({
-      where: { id: requestId },
-    });
-    if (!request) throw new NotFoundError("Approval request not found.");
-    if (request.status !== "pending") {
-      throw new ConflictError("This request has already been decided.");
-    }
-    if (request.requesterId === decider.id) {
-      throw new ForbiddenError("You cannot approve or reject your own request.");
-    }
-    if (decider.role !== request.requiredRole) {
-      throw new ForbiddenError(
-        `This request requires a ${request.requiredRole} decision.`,
-      );
-    }
+  let decided: ApprovalRequest;
+  try {
+    decided = await withAudit(decider.id, async (tx) => {
+      const request = await tx.approvalRequest.findUnique({
+        where: { id: requestId },
+      });
+      if (!request) throw new NotFoundError("Approval request not found.");
+      if (request.status !== "pending") {
+        throw new ConflictError("This request has already been decided.");
+      }
 
-    const status = approve ? "approved" : "rejected";
-    const updated = await tx.approvalRequest.update({
-      where: { id: request.id },
-      data: {
-        status,
-        decidedById: decider.id,
-        decisionNote: note ?? null,
-        decidedAt: new Date(),
-      },
+      // The decider's role comes from the database — a caller-supplied role
+      // is just a claim.
+      const deciderRow = await tx.user.findUnique({
+        where: { id: decider.id },
+      });
+      if (!deciderRow) {
+        throw new ForbiddenError("Deciding user not found.");
+      }
+      if (request.requesterId === deciderRow.id) {
+        throw new ForbiddenError(
+          "You cannot approve or reject your own request.",
+        );
+      }
+      if (deciderRow.role !== request.requiredRole) {
+        throw new ForbiddenError(
+          `This request requires a ${request.requiredRole} decision.`,
+        );
+      }
+
+      const toolHooks = hooks.get(request.entityType);
+      if (!toolHooks) {
+        throw new NotFoundError(
+          `No approval hooks registered for entity type "${request.entityType}".`,
+        );
+      }
+      if (
+        toolHooks.requiredPermission &&
+        !hasPermission(deciderRow.role, toolHooks.requiredPermission)
+      ) {
+        throw new ForbiddenError(
+          `Role "${deciderRow.role}" lacks permission "${toolHooks.requiredPermission}".`,
+        );
+      }
+      await toolHooks.validateEntity?.(tx, request);
+
+      const status = approve ? "approved" : "rejected";
+      const updated = await tx.approvalRequest.update({
+        where: { id: request.id },
+        data: {
+          status,
+          decidedById: deciderRow.id,
+          decisionNote: note ?? null,
+          decidedAt: new Date(),
+        },
+      });
+      return {
+        value: updated,
+        audit: {
+          action: `approval.${status}`,
+          entityType: "approval_request",
+          entityId: request.id,
+          before: request,
+          after: updated,
+        },
+      };
     });
-    return {
-      value: updated,
-      audit: {
-        action: `approval.${status}`,
+  } catch (e) {
+    // Failed decisions are themselves auditable events — an unauthorized or
+    // unresolvable attempt should leave a trail.
+    try {
+      await recordStandaloneAudit(decider.id, {
+        action: "approval.decide_failed",
         entityType: "approval_request",
-        entityId: request.id,
-        before: request,
-        after: updated,
-      },
-    };
-  });
+        entityId: requestId,
+        after: { error: e instanceof Error ? e.message : String(e) },
+      });
+    } catch (auditErr) {
+      console.error("Failed to audit a rejected decision:", auditErr);
+    }
+    // A refusal (HookRefusalError) means the request cannot lawfully decide
+    // this entity — e.g. it is not the entity's linked request. The decision
+    // rolled back; resolve quietly with the still-pending request rather than
+    // surfacing it as an error, the same way a post-commit hook refusal is
+    // swallowed below.
+    if (e instanceof HookRefusalError) {
+      return db.approvalRequest.findUniqueOrThrow({
+        where: { id: requestId },
+      });
+    }
+    throw e;
+  }
 
   // Tool callbacks run after the decision commits: they may call external
-  // systems (payments) which should not hold a DB transaction open.
+  // systems (payments) which should not hold a DB transaction open. A
+  // HookRefusalError is a handled outcome (recorded, not rethrown); any other
+  // hook failure is audited and propagated to the caller.
   const toolHooks = hooks.get(decided.entityType);
-  if (decided.status === "approved") {
-    await toolHooks?.onApproved?.(decided);
-  } else if (decided.status === "rejected") {
-    await toolHooks?.onRejected?.(decided);
+  const hook =
+    decided.status === "approved"
+      ? toolHooks?.onApproved
+      : decided.status === "rejected"
+        ? toolHooks?.onRejected
+        : undefined;
+  if (decided.status !== "pending" && !toolHooks) {
+    console.warn(
+      `No approval hooks registered for entityType "${decided.entityType}".`,
+    );
+  }
+  if (hook) {
+    try {
+      await hook(decided);
+    } catch (e) {
+      const refused = e instanceof HookRefusalError;
+      await recordStandaloneAudit(decider.id, {
+        action: refused ? "approval.execution_refused" : "approval.hook_failed",
+        entityType: "approval_request",
+        entityId: decided.id,
+        after: {
+          error: e instanceof Error ? e.message : String(e),
+          status: decided.status,
+        },
+      });
+      if (!refused) throw e;
+    }
   }
   return decided;
 }
 
-export function listPendingApprovalsFor(role: string) {
+async function recordStandaloneAudit(
+  actorId: string,
+  entry: Parameters<typeof recordAudit>[2],
+) {
+  await db.$transaction((tx) => recordAudit(tx, actorId, entry));
+}
+
+export async function listPendingApprovalsFor(
+  user: { id: string; role: string } | null,
+) {
+  // Permission is checked against the stored role — the caller-supplied
+  // object is a claim, so the queue can never be entered under a forged one.
+  const actor = await resolveActor(user);
+  requirePermission(actor, "refunds:approve");
   return db.approvalRequest.findMany({
-    where: { status: "pending", requiredRole: role },
+    where: { status: "pending", requiredRole: actor!.role },
     include: { requester: true },
     orderBy: { createdAt: "desc" },
   });

@@ -25,8 +25,11 @@ export default async function RefundRequestsPage({
     );
   }
 
+  // The pending queue requires refunds:approve; readers without it still see
+  // the full request history below.
+  const canDecide = hasPermission(user.role, "refunds:approve");
   const [queue, all] = await Promise.all([
-    listPendingApprovalsFor(user.role),
+    canDecide ? listPendingApprovalsFor(user) : Promise.resolve([]),
     listApprovals(),
   ]);
 
@@ -38,8 +41,6 @@ export default async function RefundRequestsPage({
   const refundByApprovalId = new Map(
     refunds.map((r) => [r.approvalRequestId, r]),
   );
-
-  const canDecide = hasPermission(user.role, "refunds:approve");
 
   return (
     <>
