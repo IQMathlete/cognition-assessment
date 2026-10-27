@@ -47,7 +47,8 @@ describe("rejection-side linkage — crafted rejections must not touch refunds",
     await decideRefund(users.bob, {
       approvalRequestId: crafted.id,
       approve: false,
-    });
+        note: "test justification",
+      });
     expect(await refundStatus(refund.id)).toBe("requested");
   });
 
@@ -66,14 +67,16 @@ describe("rejection-side linkage — crafted rejections must not touch refunds",
     await decideRefund(users.bob, {
       approvalRequestId: crafted.id,
       approve: false,
-    });
+        note: "test justification",
+      });
 
     // Even if the crafted rejection landed, the refund's OWN pending request
     // must still be able to execute it — a murdered refund should not stay dead.
     await decideRefund(users.bob, {
       approvalRequestId: refund.approvalRequestId!,
       approve: true,
-    });
+        note: "test justification",
+      });
     expect(await refundStatus(refund.id)).toBe("executed");
     expect(payments.calls).toHaveLength(1);
   });
@@ -88,7 +91,8 @@ describe("rejection-side linkage — crafted rejections must not touch refunds",
     await decideRefund(users.bob, {
       approvalRequestId: refund.approvalRequestId!,
       approve: true,
-    });
+        note: "test justification",
+      });
     const crafted = await craftApproval({
       requesterId: users.alice.id,
       requiredRole: "support_lead",
@@ -98,6 +102,7 @@ describe("rejection-side linkage — crafted rejections must not touch refunds",
       decideRefund(users.bob, {
         approvalRequestId: crafted.id,
         approve: false,
+        note: "test justification",
       }),
     ).rejects.toThrow();
     expect(await refundStatus(refund.id)).toBe("executed");
@@ -146,7 +151,8 @@ describe("entity provenance and registered-tool governance", () => {
     await decideRefund(users.bob, {
       approvalRequestId: approval.id,
       approve: true,
-    });
+        note: "test justification",
+      });
     expect(await refundStatus(refund.id)).not.toBe("executed");
     expect(payments.calls).toHaveLength(0);
   });
@@ -163,6 +169,7 @@ describe("entity provenance and registered-tool governance", () => {
         requestId: crafted.id,
         decider: users.bob,
         approve: true,
+        note: "test justification",
       }),
     ).rejects.toThrow();
   });
@@ -182,7 +189,8 @@ describe("entity provenance and registered-tool governance", () => {
     await decideRefund(users.bob, {
       approvalRequestId: crafted.id,
       approve: true,
-    });
+        note: "test justification",
+      });
     // The hook refused execution — the decision itself should not stand.
     const req = await db.approvalRequest.findUniqueOrThrow({
       where: { id: crafted.id },
@@ -205,7 +213,9 @@ describe("identity and role-claim consistency", () => {
     await expect(
       decideRefund(
         { id: users.fiona.id, role: "support_agent" },
-        { approvalRequestId: refund.approvalRequestId!, approve: true },
+        { approvalRequestId: refund.approvalRequestId!, approve: true,
+        note: "test justification",
+      },
       ),
     ).rejects.toThrow(ForbiddenError);
     expect(await refundStatus(refund.id)).toBe("requested");
@@ -222,7 +232,9 @@ describe("identity and role-claim consistency", () => {
     await expect(
       decideApproval({
         requestId: refund.approvalRequestId!,
-        decider: { id: users.kai.id, role: "support_lead" },
+        decider: { id: users.kai.id, role: "support_lead",
+        note: "test justification",
+      },
         approve: true,
       }),
     ).rejects.toThrow(ForbiddenError);

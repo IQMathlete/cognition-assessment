@@ -55,6 +55,14 @@ const APPLICANTS = [
 
 const COUNTRIES = ["US", "CA", "GB", "DE", "BR", "NG", "JP", "FR"];
 
+const DOCUMENT_SETS = [
+  "passport, utility bill",
+  "driver's license, bank statement",
+  "passport, tax return",
+  "national ID, utility bill",
+  "driver's license, pay stub",
+];
+
 function pick<T>(arr: T[], i: number): T {
   return arr[i % arr.length];
 }
@@ -97,28 +105,36 @@ async function main() {
   }
 
   const existingCases = await db.kycCase.count();
-  if (existingCases < 20) {
-    // ~20 synthetic KYC applications; externalIds ending in "FAIL" are
-    // declined by the mock screening vendor to exercise the failed path.
+  if (existingCases < 40) {
+    // 40 synthetic KYC cases. All PII is invented: SSNs use the 9xx area
+    // reserved for fictional/ITIN-style numbers, DOBs are arbitrary.
+    // Assignees alternate between kai (kyc_reviewer) and sam (kyc_senior);
+    // risk >= 80 routes a reviewer approval into the senior second-review
+    // queue.
+    const kai = await db.user.findUniqueOrThrow({ where: { username: "kai" } });
+    const sam = await db.user.findUniqueOrThrow({ where: { username: "sam" } });
     const riskScores = [
       12, 45, 88, 23, 71, 34, 92, 18, 55, 67,
-      78, 29, 41, 95, 8, 62, 50, 83, 15, 36,
+      81, 29, 41, 95, 8, 62, 50, 84, 15, 36,
+      73, 90, 27, 58, 11, 86, 39, 64, 21, 97,
+      48, 76, 5, 82, 31, 69, 53, 89, 17, 44,
     ];
     for (let i = 0; i < riskScores.length; i++) {
       const daysAgo = (i * 3) % 45;
-      const externalId =
-        i === 6 || i === 13
-          ? `kyc_${2000 + i}_FAIL`
-          : `kyc_${2000 + i}`;
+      const externalId = `kyc_${3000 + i}`;
       await db.kycCase.upsert({
         where: { externalId },
         update: {},
         create: {
           externalId,
           applicant: pick(APPLICANTS, i),
+          ssn: `9${String(i).padStart(2, "0")}-45-${String(6000 + i)}`,
+          dob: `${1955 + (i % 40)}-${String((i % 12) + 1).padStart(2, "0")}-${String((i % 28) + 1).padStart(2, "0")}`,
           country: pick(COUNTRIES, i * 3),
           riskScore: riskScores[i],
+          documents: pick(DOCUMENT_SETS, i),
           status: "pending",
+          assigneeId: i % 4 === 3 ? sam.id : kai.id,
           createdAt: new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000),
         },
       });
@@ -127,7 +143,7 @@ async function main() {
     console.log("Seed: KYC cases already present, skipping.");
   }
 
-  console.log("Seed complete: 8 users, 30 transactions, 20 KYC cases.");
+  console.log("Seed complete: 8 users, 30 transactions, 40 KYC cases.");
 }
 
 main()

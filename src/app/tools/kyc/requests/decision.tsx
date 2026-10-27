@@ -1,11 +1,11 @@
 "use client";
 
 import { useActionState } from "react";
-import { decideReviewAction, type FormState } from "@/tools/kyc/actions";
+import { decideCaseAction, type FormState } from "@/tools/kyc/actions";
 
 export function DecisionForm({ approvalRequestId }: { approvalRequestId: string }) {
   const [state, formAction, pending] = useActionState<FormState, FormData>(
-    decideReviewAction,
+    decideCaseAction,
     {},
   );
 
@@ -16,7 +16,9 @@ export function DecisionForm({ approvalRequestId }: { approvalRequestId: string 
         <input
           type="text"
           name="note"
-          placeholder="Decision note (optional)"
+          placeholder="Justification (required, at least 10 characters)"
+          required
+          minLength={10}
           style={{ flex: 1, minWidth: 220 }}
         />
         <button type="submit" name="decision" value="approve" disabled={pending}>

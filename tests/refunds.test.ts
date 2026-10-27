@@ -60,7 +60,8 @@ describe("audit trail", () => {
     await decideRefund(users.bob, {
       approvalRequestId: refund.approvalRequestId!,
       approve: true,
-    });
+        note: "test justification",
+      });
 
     const after = await db.auditEvent.findMany({ orderBy: { createdAt: "asc" } });
     const afterActions = after.map((e) => e.action);
@@ -90,7 +91,8 @@ describe("audit trail", () => {
     await decideRefund(users.bob, {
       approvalRequestId: refund.approvalRequestId!,
       approve: true,
-    });
+        note: "test justification",
+      });
     const final = await db.refund.findUniqueOrThrow({ where: { id: refund.id } });
     expect(final.status).toBe("failed");
     expect(final.failureReason).toBeTruthy();
@@ -110,6 +112,7 @@ describe("self-approval", () => {
       decideRefund(users.bob, {
         approvalRequestId: refund.approvalRequestId!,
         approve: true,
+        note: "test justification",
       }),
     ).rejects.toThrow(ForbiddenError);
   });
@@ -148,15 +151,16 @@ describe("threshold routing", () => {
       decideRefund(users.fiona, {
         approvalRequestId: smallReq.id,
         approve: true,
+        note: "test justification",
       }),
     ).rejects.toThrow(ForbiddenError);
     await expect(
-      decideRefund(users.bob, { approvalRequestId: bigReq.id, approve: true }),
+      decideRefund(users.bob, { approvalRequestId: bigReq.id, approve: true, note: "test justification" }),
     ).rejects.toThrow(ForbiddenError);
 
     // The right roles can.
     await expect(
-      decideRefund(users.bob, { approvalRequestId: smallReq.id, approve: true }),
+      decideRefund(users.bob, { approvalRequestId: smallReq.id, approve: true, note: "test justification" }),
     ).resolves.toMatchObject({ status: "approved" });
     await expect(
       decideRefund(users.fiona, {

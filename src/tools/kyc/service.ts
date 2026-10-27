@@ -5,7 +5,7 @@ import {
   decideApproval,
   registerApprovalHooks,
 } from "@/platform/approvals";
-import { requirePermission } from "@/platform/rbac";
+import { hasPermission, requirePermission } from "@/platform/rbac";
 import { resolveActor } from "@/platform/actor";
 import {
   ConflictError,
@@ -13,37 +13,74 @@ import {
   NotFoundError,
   ValidationError,
 } from "@/platform/errors";
-import { MockScreeningClient, type ScreeningClient } from "./screening";
 
-export const HIGH_RISK_SCORE = 70;
+// Cases at or above this risk score need a second review by a kyc_senior
+// before the reviewer's approval becomes final.
+export const SECOND_REVIEW_RISK = 80;
 
-// Standard cases are decided by a kyc_senior; high-risk applicants escalate to
-// the finance_approver, which stands in for the financial-crimes committee a
-// real deployment would route to. Mirrors the refunds amount threshold.
-export function requiredRoleForReview(riskScore: number): string {
-  return riskScore < HIGH_RISK_SCORE ? "kyc_senior" : "finance_approver";
-}
+const SENIOR_ROLE = "kyc_senior";
 
-// Statuses that reserve the case for a review in flight. Rejected and failed
-// reviews free the case for a retry.
-const ACTIVE_STATUSES = ["requested", "approved"] as const;
+// Statuses that hold a case in the senior queue: the linked approval request
+// reserves the verdict, so no other disposition may touch the case.
+const AWAITING_SENIOR = ["escalated", "pending_second_review"] as const;
 
-const REVIEW_TRANSITIONS: Record<string, readonly string[]> = {
-  requested: ["approved", "rejected", "failed"],
-  approved: ["executed", "failed"],
+const CASE_TRANSITIONS: Record<string, readonly string[]> = {
+  pending: ["verified", "rejected", "escalated", "pending_second_review"],
+  escalated: ["verified", "rejected"],
+  pending_second_review: ["verified", "rejected"],
+  verified: [],
   rejected: [],
-  executed: [],
-  failed: [],
 };
 
-const REVIEW_RECOMMENDATIONS = ["verify", "reject"] as const;
-export type ReviewRecommendation = (typeof REVIEW_RECOMMENDATIONS)[number];
+const DISPOSITIONS = ["approve", "reject", "escalate"] as const;
+export type Disposition = (typeof DISPOSITIONS)[number];
 
-let screeningClient: ScreeningClient = new MockScreeningClient();
+// --- PII masking -------------------------------------------------------------
+// ssn and dob never leave the service unmasked: every read path returns masked
+// values; only revealPii (kyc:reveal, audited) returns the raw fields.
 
-/** Test seam — inject a stub ScreeningClient. */
-export function setScreeningClient(client: ScreeningClient): void {
-  screeningClient = client;
+export function maskSsn(ssn: string): string {
+  return `***-**-${ssn.slice(-4)}`;
+}
+
+export function maskDob(dob: string): string {
+  return dob.slice(0, 4); // year only
+}
+
+function masked<T extends { ssn: string; dob: string }>(row: T) {
+  return { ...row, ssn: maskSsn(row.ssn), dob: maskDob(row.dob) };
+}
+
+// Audit snapshots of a case get the same masking — otherwise /admin's audit
+// log would hand unmasked PII to a platform_admin with no reveal reason.
+function auditedCase<T extends { ssn: string; dob: string }>(row: T) {
+  return masked(row);
+}
+
+// A kyc_reviewer only sees cases assigned to them; a kyc_senior sees the whole
+// queue. The check keys on stored permissions, not a role-name comparison.
+function caseScope(actor: { id: string; role: string }) {
+  return hasPermission(actor.role, "kyc:approve")
+    ? {}
+    : { assigneeId: actor.id };
+}
+
+async function loadVisibleCase(
+  tx: Tx,
+  actor: { id: string; role: string },
+  caseId: string,
+) {
+  const kycCase = await tx.kycCase.findUnique({ where: { id: caseId } });
+  // NotFound rather than Forbidden: a reviewer must not learn that another
+  // reviewer's case exists by probing ids.
+  if (!kycCase) throw new NotFoundError("KYC case not found.");
+  if (
+    !hasPermission(actor.role, "kyc:approve") &&
+    kycCase.assigneeId !== actor.id
+  ) {
+    throw new NotFoundError("KYC case not found.");
+  }
+  return kycCase;
 }
 
 export async function searchCases(
@@ -53,94 +90,162 @@ export async function searchCases(
   const actor = await resolveActor(user);
   requirePermission(actor, "kyc:read");
   const q = query?.trim();
-  return db.kycCase.findMany({
-    where: q
-      ? {
-          OR: [
-            { externalId: { contains: q } },
-            { applicant: { contains: q } },
-            { country: { contains: q } },
-          ],
-        }
-      : undefined,
+  const rows = await db.kycCase.findMany({
+    where: {
+      ...caseScope(actor),
+      ...(q
+        ? {
+            OR: [
+              { externalId: { contains: q } },
+              { applicant: { contains: q } },
+              { country: { contains: q } },
+            ],
+          }
+        : {}),
+    },
+    include: { assignee: { select: { username: true } } },
     orderBy: { createdAt: "desc" },
+  });
+  return rows.map(masked);
+}
+
+export async function getCase(
+  user: { id: string; role: string } | null,
+  caseId: string,
+) {
+  const actor = await resolveActor(user);
+  requirePermission(actor, "kyc:read");
+  const row = await loadVisibleCase(db, actor, caseId);
+  return masked(row);
+}
+
+/**
+ * The reviewer's disposition on an assigned case:
+ *  - approve: riskScore >= SECOND_REVIEW_RISK routes the case into the senior
+ *    queue as a second-review request; below the threshold the case is
+ *    verified immediately.
+ *  - reject: closes the case rejected.
+ *  - escalate: routes the case into the senior queue unresolved.
+ * Every disposition requires a reason and is audited; a case awaiting a
+ * senior decision cannot be dispositioned again.
+ */
+export async function dispositionCase(
+  user: { id: string; role: string } | null,
+  input: { caseId: string; action: string; reason: string },
+) {
+  const actor = await resolveActor(user);
+  requirePermission(actor, "kyc:review");
+  const reason = input.reason.trim();
+  if (!reason) throw new ValidationError("A reason is required.");
+  if (!(DISPOSITIONS as readonly string[]).includes(input.action)) {
+    throw new ValidationError("Action must be approve, reject, or escalate.");
+  }
+
+  return withAudit(actor.id, async (tx) => {
+    const before = await loadVisibleCase(tx, actor, input.caseId);
+    if (before.status !== "pending") {
+      throw new ConflictError(
+        `Case is not awaiting review (status: ${before.status}).`,
+      );
+    }
+
+    if (input.action === "reject") {
+      const after = await tx.kycCase.update({
+        where: { id: before.id },
+        data: { status: "rejected" },
+      });
+      return {
+        value: after,
+        audit: {
+          action: "kyc_case.rejected",
+          entityType: "kyc_case",
+          entityId: before.id,
+          before: auditedCase(before),
+          after: { ...auditedCase(after), reason },
+        },
+      };
+    }
+
+    if (input.action === "approve" && before.riskScore < SECOND_REVIEW_RISK) {
+      const after = await tx.kycCase.update({
+        where: { id: before.id },
+        data: { status: "verified" },
+      });
+      return {
+        value: after,
+        audit: {
+          action: "kyc_case.verified",
+          entityType: "kyc_case",
+          entityId: before.id,
+          before: auditedCase(before),
+          after: { ...auditedCase(after), reason },
+        },
+      };
+    }
+
+    // Escalate, or approve on a high-risk case: the senior queue decides.
+    const toStatus =
+      input.action === "escalate" ? "escalated" : "pending_second_review";
+    const approval = await createApprovalRequest(tx, {
+      requesterId: actor.id,
+      requiredRole: SENIOR_ROLE,
+      entityType: "kyc_case",
+      entityId: before.id,
+      reason,
+    });
+    const after = await tx.kycCase.update({
+      where: { id: before.id },
+      data: { status: toStatus, approvalRequestId: approval.id },
+    });
+    return {
+      value: after,
+      audit: {
+        action:
+          input.action === "escalate"
+            ? "kyc_case.escalated"
+            : "kyc_case.second_review_requested",
+        entityType: "kyc_case",
+        entityId: before.id,
+        before: auditedCase(before),
+        after: { ...auditedCase(after), reason },
+      },
+    };
   });
 }
 
-export async function requestReview(
+/**
+ * kyc_senior-only: reveal the unmasked SSN and DOB of a case. Requires a
+ * reason and writes an audit event naming the fields revealed — the audit
+ * row deliberately does NOT contain the values themselves.
+ */
+export async function revealPii(
   user: { id: string; role: string } | null,
-  input: { caseId: string; recommendation: string; reason: string },
+  input: { caseId: string; reason: string },
 ) {
   const actor = await resolveActor(user);
-  requirePermission(actor, "kyc:create");
+  requirePermission(actor, "kyc:reveal");
   const reason = input.reason.trim();
   if (!reason) throw new ValidationError("A reason is required.");
-  if (
-    !(REVIEW_RECOMMENDATIONS as readonly string[]).includes(
-      input.recommendation,
-    )
-  ) {
-    throw new ValidationError("Recommendation must be verify or reject.");
-  }
 
   return withAudit(actor.id, async (tx) => {
     const kycCase = await tx.kycCase.findUnique({
       where: { id: input.caseId },
     });
     if (!kycCase) throw new NotFoundError("KYC case not found.");
-    if (kycCase.status !== "pending") {
-      throw new ValidationError(
-        "Only pending cases can be submitted for review.",
-      );
-    }
-
-    // One active review per case: an outstanding requested/approved review
-    // already reserves the decision, so a second request cannot race it.
-    const active = await tx.kycReview.count({
-      where: { caseId: kycCase.id, status: { in: [...ACTIVE_STATUSES] } },
-    });
-    if (active > 0) {
-      throw new ValidationError(
-        "This case already has a review in flight.",
-      );
-    }
-
-    const review = await tx.kycReview.create({
-      data: {
-        caseId: kycCase.id,
-        recommendation: input.recommendation,
-        reason,
-        requestedById: actor.id,
-        status: "requested",
-      },
-    });
-    // createApprovalRequest writes its own approval.requested audit row.
-    const approval = await createApprovalRequest(tx, {
-      requesterId: actor.id,
-      requiredRole: requiredRoleForReview(kycCase.riskScore),
-      entityType: "kyc_review",
-      entityId: review.id,
-      reason,
-    });
-    const value = await tx.kycReview.update({
-      where: { id: review.id },
-      data: { approvalRequestId: approval.id },
-    });
-
     return {
-      value,
+      value: { ssn: kycCase.ssn, dob: kycCase.dob },
       audit: {
-        action: "kyc_review.requested",
-        entityType: "kyc_review",
-        entityId: review.id,
-        after: value,
+        action: "kyc_case.pii_revealed",
+        entityType: "kyc_case",
+        entityId: kycCase.id,
+        after: { fields: ["ssn", "dob"], reason },
       },
     };
   });
 }
 
-/** Approving or rejecting a review request. Role checks live in decideApproval. */
-export async function decideReview(
+/** Approving or rejecting a senior-queue request. Role checks live in decideApproval. */
+export async function decideCase(
   user: { id: string; role: string } | null,
   input: { approvalRequestId: string; approve: boolean; note?: string },
 ) {
@@ -150,8 +255,8 @@ export async function decideReview(
     where: { id: input.approvalRequestId },
   });
   if (!request) throw new NotFoundError("Approval request not found.");
-  if (request.entityType !== "kyc_review") {
-    throw new ValidationError("Not a KYC review approval request.");
+  if (request.entityType !== "kyc_case") {
+    throw new ValidationError("Not a KYC case approval request.");
   }
   return decideApproval({
     requestId: request.id,
@@ -161,256 +266,116 @@ export async function decideReview(
   });
 }
 
-async function setReviewStatus(
-  actorId: string,
-  reviewId: string,
-  to: string,
-  extra: { screeningResultId?: string; failureReason?: string } = {},
-) {
+async function setCaseStatus(actorId: string, caseId: string, to: string) {
   return withAudit(actorId, async (tx) => {
-    const before = await tx.kycReview.findUniqueOrThrow({
-      where: { id: reviewId },
+    const before = await tx.kycCase.findUniqueOrThrow({
+      where: { id: caseId },
     });
-    if (!REVIEW_TRANSITIONS[before.status]?.includes(to)) {
+    if (!CASE_TRANSITIONS[before.status]?.includes(to)) {
       throw new ConflictError(
-        `Review cannot transition ${before.status} -> ${to}.`,
+        `Case cannot transition ${before.status} -> ${to}.`,
       );
     }
-    const after = await tx.kycReview.update({
-      where: { id: reviewId },
-      data: { status: to, ...extra },
+    const after = await tx.kycCase.update({
+      where: { id: caseId },
+      data: { status: to },
     });
     return {
       value: after,
       audit: {
-        action: "kyc_review.status",
-        entityType: "kyc_review",
-        entityId: reviewId,
-        before,
-        after,
+        action: `kyc_case.${to}`,
+        entityType: "kyc_case",
+        entityId: caseId,
+        before: auditedCase(before),
+        after: auditedCase(after),
       },
     };
   });
 }
 
-// --- Approval hooks ---------------------------------------------------------
+// --- Approval hooks ----------------------------------------------------------
 
-export async function onReviewApproved(request: {
-  id?: string;
-  entityId: string;
-  decidedById: string | null;
-}) {
-  const actorId = request.decidedById ?? "system";
-
-  // Approve inside a single transaction that re-verifies the decision's
-  // linkage and that the case is still awaiting a verdict, so crafted or
-  // racing approvals cannot apply a decision to a closed case.
-  const review = await withAudit(actorId, async (tx) => {
-    const before = await tx.kycReview.findUniqueOrThrow({
-      where: { id: request.entityId },
-      include: { case: true },
-    });
-
-    // Only the review's own linked approval request may execute it.
-    if (before.approvalRequestId !== request.id) {
-      throw new HookRefusalError(
-        "Approval request is not linked to this review.",
-      );
-    }
-    if (!REVIEW_TRANSITIONS[before.status]?.includes("approved")) {
-      throw new ConflictError(
-        `Review cannot transition ${before.status} -> approved.`,
-      );
-    }
-    if (before.case.status !== "pending") {
-      const failed = await tx.kycReview.update({
-        where: { id: before.id },
-        data: {
-          status: "failed",
-          failureReason: "Case is no longer pending.",
-        },
-      });
-      return {
-        value: { review: failed, kycCase: before.case, proceed: false },
-        audit: {
-          action: "kyc_review.status",
-          entityType: "kyc_review",
-          entityId: before.id,
-          before,
-          after: failed,
-        },
-      };
-    }
-
-    const approved = await tx.kycReview.update({
-      where: { id: before.id },
-      data: { status: "approved" },
-    });
-    return {
-      value: { review: approved, kycCase: before.case, proceed: true },
-      audit: {
-        action: "kyc_review.status",
-        entityType: "kyc_review",
-        entityId: before.id,
-        before,
-        after: approved,
-      },
-    };
-  });
-
-  if (!review.proceed) return;
-
-  let result;
-  try {
-    result = await screeningClient.submitVerdict({
-      caseExternalId: review.kycCase.externalId,
-      verdict: review.review.recommendation as ReviewRecommendation,
-      idempotencyKey: review.review.id,
-    });
-  } catch (e) {
-    // A transport-level failure marks the review failed (audited) and
-    // propagates so the decider sees the execution problem.
-    await setReviewStatus(actorId, review.review.id, "failed", {
-      failureReason: `Screening client error: ${
-        e instanceof Error ? e.message : String(e)
-      }`,
-    });
-    throw e;
-  }
-
-  if (result.ok) {
-    // Verdict lands on the case in the same transaction that closes the
-    // review — the two can never disagree.
-    await withAudit(actorId, async (tx) => {
-      const before = await tx.kycReview.findUniqueOrThrow({
-        where: { id: review.review.id },
-      });
-      if (!REVIEW_TRANSITIONS[before.status]?.includes("executed")) {
-        throw new ConflictError(
-          `Review cannot transition ${before.status} -> executed.`,
-        );
-      }
-      const beforeCase = await tx.kycCase.findUniqueOrThrow({
-        where: { id: before.caseId },
-      });
-      const caseStatus =
-        before.recommendation === "verify" ? "verified" : "rejected";
-      const after = await tx.kycReview.update({
-        where: { id: before.id },
-        data: { status: "executed", screeningResultId: result.screeningResultId },
-      });
-      const afterCase = await tx.kycCase.update({
-        where: { id: beforeCase.id },
-        data: { status: caseStatus },
-      });
-      return {
-        value: after,
-        audit: [
-          {
-            action: "kyc_review.status",
-            entityType: "kyc_review",
-            entityId: before.id,
-            before,
-            after,
-          },
-          {
-            action: "kyc_case.status",
-            entityType: "kyc_case",
-            entityId: beforeCase.id,
-            before: beforeCase,
-            after: afterCase,
-          },
-        ],
-      };
-    });
-  } else {
-    await setReviewStatus(actorId, review.review.id, "failed", {
-      failureReason: result.failureReason,
-    });
-  }
-}
-
-export async function onReviewRejected(request: {
-  id?: string;
-  entityId: string;
-  decidedById: string | null;
-}) {
-  // Same linkage rule as the approve path: a crafted rejection must not
-  // move a review that belongs to a different approval request.
-  const review = await db.kycReview.findUnique({
-    where: { id: request.entityId },
+async function assertLinkedCase(caseId: string, requestId?: string) {
+  const kycCase = await db.kycCase.findUnique({
+    where: { id: caseId },
     select: { approvalRequestId: true },
   });
-  if (review && review.approvalRequestId !== request.id) {
+  if (kycCase && kycCase.approvalRequestId !== requestId) {
     throw new HookRefusalError(
-      "Approval request is not linked to this review.",
+      "Approval request is not linked to this case.",
     );
   }
-  await setReviewStatus(
+}
+
+export async function onCaseApproved(request: {
+  id?: string;
+  entityId: string;
+  decidedById: string | null;
+}) {
+  await assertLinkedCase(request.entityId, request.id);
+  await setCaseStatus(
+    request.decidedById ?? "system",
+    request.entityId,
+    "verified",
+  );
+}
+
+export async function onCaseRejected(request: {
+  id?: string;
+  entityId: string;
+  decidedById: string | null;
+}) {
+  await assertLinkedCase(request.entityId, request.id);
+  await setCaseStatus(
     request.decidedById ?? "system",
     request.entityId,
     "rejected",
   );
 }
 
-export async function listReviews(
-  user: { id: string; role: string } | null,
-) {
-  const actor = await resolveActor(user);
-  requirePermission(actor, "kyc:read");
-  return db.kycReview.findMany({
-    include: { case: true, requestedBy: true },
-    orderBy: { createdAt: "desc" },
-  });
-}
-
-// Plug into the approvals primitive. Living in this module (not the barrel
-// file) means any import path that can reach the service also registers the
-// hooks — an approval can never land without its execution callbacks.
-//
-// requiredPermission makes deciding impossible for roles that merely share
-// a name with requiredRole; validateEntity keeps decisions on dangling
-// entities from committing at all.
-registerApprovalHooks("kyc_review", {
+// Plug into the approvals primitive. requiredPermission keeps deciding
+// impossible for roles that merely share a name with requiredRole;
+// validateEntity keeps decisions on crafted or dangling requests from
+// committing at all.
+registerApprovalHooks("kyc_case", {
   requiredPermission: "kyc:approve",
-  // Runs inside the decision transaction: a request may only decide a review
-  // that exists, is still awaiting its decision, is linked to THIS request,
-  // names the same requester, and came through the audited requestReview path.
-  // Provenance checks throw HookRefusalError — the decision rolls back and is
-  // recorded as a failed decision rather than committed.
+  // Runs inside the decision transaction: the request may only decide a case
+  // that exists, is awaiting a senior decision, is linked to THIS request,
+  // and arrived via the audited disposition path. Provenance failures throw
+  // HookRefusalError so the decision rolls back rather than committing.
   validateEntity: async (tx: Tx, request) => {
-    const review = await tx.kycReview.findUnique({
+    const kycCase = await tx.kycCase.findUnique({
       where: { id: request.entityId },
     });
-    if (!review) throw new NotFoundError("KYC review not found.");
-    if (review.status !== "requested") {
+    if (!kycCase) throw new NotFoundError("KYC case not found.");
+    if (!(AWAITING_SENIOR as readonly string[]).includes(kycCase.status)) {
       throw new ConflictError(
-        `Review is no longer awaiting a decision (status: ${review.status}).`,
+        `Case is not awaiting a senior decision (status: ${kycCase.status}).`,
       );
     }
-    if (review.approvalRequestId !== request.id) {
+    if (kycCase.approvalRequestId !== request.id) {
       throw new HookRefusalError(
-        "Approval request is not linked to this review.",
+        "Approval request is not linked to this case.",
       );
     }
-    if (review.requestedById !== request.requesterId) {
-      throw new HookRefusalError(
-        "Approval requester does not match the review requester.",
-      );
-    }
+    // The requester must be the actor who routed this case into the senior
+    // queue — which need not be the assignee (a senior may escalate or
+    // second-review another reviewer's case). Provenance is proven by the
+    // audited disposition row carrying the requester as its actor.
     const requestedAudit = await tx.auditEvent.findFirst({
       where: {
-        action: "kyc_review.requested",
-        entityType: "kyc_review",
-        entityId: review.id,
+        entityType: "kyc_case",
+        entityId: kycCase.id,
+        actorId: request.requesterId,
+        action: { in: ["kyc_case.escalated", "kyc_case.second_review_requested"] },
       },
     });
     if (!requestedAudit) {
       throw new HookRefusalError(
-        "Review was not created through the audited request path.",
+        "Case was not routed to the senior queue through the audited path.",
       );
     }
   },
-  onApproved: onReviewApproved,
-  onRejected: onReviewRejected,
+  onApproved: onCaseApproved,
+  onRejected: onCaseRejected,
 });

@@ -16,7 +16,6 @@ export async function resetDb() {
   await dropAuditGuards();
   await db.$transaction([
     db.auditEvent.deleteMany(),
-    db.kycReview.deleteMany(),
     db.kycCase.deleteMany(),
     db.refund.deleteMany(),
     db.approvalRequest.deleteMany(),
@@ -48,6 +47,7 @@ export async function seedTransaction(amountCents: number, externalId = "txn_t1"
 
 export async function seedCase(
   riskScore: number,
+  assigneeId: string,
   externalId = "kyc_t1",
   status = "pending",
 ) {
@@ -55,9 +55,13 @@ export async function seedCase(
     data: {
       externalId,
       applicant: "T. Applicant",
+      ssn: "999-00-1234",
+      dob: "1985-04-12",
       country: "US",
       riskScore,
+      documents: "passport, utility bill",
       status,
+      assigneeId,
     },
   });
 }

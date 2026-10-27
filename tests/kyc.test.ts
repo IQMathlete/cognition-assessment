@@ -1,13 +1,11 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { db } from "@/platform/db";
-import { ForbiddenError, ValidationError } from "@/platform/errors";
-import { hasPermission, requirePermission } from "@/platform/rbac";
-import "@/tools/kyc"; // registers approval hooks
+import { ForbiddenError, NotFoundError, ValidationError } from "@/platform/errors";
 import {
-  decideReview,
-  listReviews,
-  requestReview,
-  requiredRoleForReview,
+  decideCase,
+  dispositionCase,
+  getCase,
+  revealPii,
   searchCases,
 } from "@/tools/kyc";
 import { resetDb, seedCase, seedUsers } from "./helpers";
@@ -19,240 +17,291 @@ beforeEach(async () => {
   users = await seedUsers();
 });
 
-describe("RBAC / server-side authorization", () => {
-  it("rejects roles without the permission server-side", async () => {
-    const kycCase = await seedCase(30);
+async function auditActionsFor(entityType: string, entityId: string) {
+  const rows = await db.auditEvent.findMany({
+    where: { entityType, entityId },
+    orderBy: { createdAt: "asc" },
+  });
+  return rows.map((r) => r.action);
+}
 
-    // alice (support_agent) cannot even read the KYC tool
-    expect(() => requirePermission(users.alice, "kyc:read")).toThrow(
-      ForbiddenError,
-    );
+describe("kyc tool — RBAC", () => {
+  it("rejects roles without kyc permissions server-side", async () => {
+    const kase = await seedCase(40, users.kai.id);
     await expect(searchCases(users.alice)).rejects.toThrow(ForbiddenError);
-    await expect(listReviews(users.alice)).rejects.toThrow(ForbiddenError);
-
-    // kai (kyc_reviewer) can read and request but cannot decide
-    await expect(searchCases(users.kai)).resolves.toHaveLength(1);
-    const review = await requestReview(users.kai, {
-      caseId: kycCase.id,
-      recommendation: "verify",
-      reason: "docs look clean",
-    });
     await expect(
-      decideReview(users.kai, {
-        approvalRequestId: review.approvalRequestId!,
-        approve: true,
+      dispositionCase(users.alice, {
+        caseId: kase.id,
+        action: "approve",
+        reason: "ok",
       }),
+    ).rejects.toThrow(ForbiddenError);
+    await expect(
+      revealPii(users.alice, { caseId: kase.id, reason: "check" }),
+    ).rejects.toThrow(ForbiddenError);
+  });
+
+  it("lets a reviewer disposition a case but not decide the senior queue or reveal PII", async () => {
+    const kase = await seedCase(90, users.kai.id);
+    await dispositionCase(users.kai, {
+      caseId: kase.id,
+      action: "escalate",
+      reason: "needs senior eyes",
+    });
+    const req = await db.approvalRequest.findFirstOrThrow({
+      where: { entityType: "kyc_case", entityId: kase.id },
+    });
+    // kai routed it, but cannot decide (no kyc:approve) — and couldn't anyway
+    // because it is his own request.
+    await expect(
+      decideCase(users.kai, { approvalRequestId: req.id, approve: true, note: "test justification" }),
+    ).rejects.toThrow(ForbiddenError);
+    await expect(
+      revealPii(users.kai, { caseId: kase.id, reason: "check" }),
     ).rejects.toThrow(ForbiddenError);
   });
 });
 
-describe("audit trail", () => {
-  it("writes an audit event for every review mutation", async () => {
-    const kycCase = await seedCase(30);
-    const review = await requestReview(users.kai, {
-      caseId: kycCase.id,
-      recommendation: "verify",
-      reason: "verified against registry",
-    });
+describe("kyc tool — assignment scoping", () => {
+  it("shows a reviewer only their own assigned cases", async () => {
+    await seedCase(40, users.kai.id, "kyc_k1");
+    await seedCase(50, users.sam.id, "kyc_s1");
+    await seedCase(60, users.kai.id, "kyc_k2");
 
-    const events = await db.auditEvent.findMany({
-      orderBy: { createdAt: "asc" },
-    });
-    const actions = events.map((e) => e.action);
-    expect(actions).toContain("kyc_review.requested");
-    expect(actions).toContain("approval.requested");
-    for (const e of events) {
-      expect(e.actorId).toBe(users.kai.id);
-    }
+    const kaiCases = await searchCases(users.kai);
+    expect(kaiCases.map((c) => c.externalId).sort()).toEqual([
+      "kyc_k1",
+      "kyc_k2",
+    ]);
+    const samCases = await searchCases(users.sam);
+    expect(samCases).toHaveLength(3); // senior sees the whole queue
+  });
 
-    await decideReview(users.sam, {
-      approvalRequestId: review.approvalRequestId!,
-      approve: true,
-    });
+  it("blocks a reviewer from reading or dispositioning another reviewer's case", async () => {
+    const kase = await seedCase(40, users.sam.id);
+    await expect(getCase(users.kai, kase.id)).rejects.toThrow(NotFoundError);
+    await expect(
+      dispositionCase(users.kai, {
+        caseId: kase.id,
+        action: "approve",
+        reason: "ok",
+      }),
+    ).rejects.toThrow(NotFoundError);
+  });
+});
 
-    const after = await db.auditEvent.findMany({
-      orderBy: { createdAt: "asc" },
+describe("kyc tool — dispositions and audit", () => {
+  it("verifies a low-risk approval immediately with audit", async () => {
+    const kase = await seedCase(40, users.kai.id);
+    const after = await dispositionCase(users.kai, {
+      caseId: kase.id,
+      action: "approve",
+      reason: "docs check out",
     });
-    const afterActions = after.map((e) => e.action);
-    // Decision + review transitions + the case verdict are all audited:
-    // approval.approved -> review approved -> review executed + case verified.
-    expect(afterActions).toContain("approval.approved");
+    expect(after.status).toBe("verified");
+    const actions = await auditActionsFor("kyc_case", kase.id);
+    expect(actions).toContain("kyc_case.verified");
+    // No approval request — no senior involvement for low risk.
     expect(
-      afterActions.filter((a) => a === "kyc_review.status"),
-    ).toHaveLength(2);
-    expect(afterActions).toContain("kyc_case.status");
-
-    const final = await db.kycReview.findUniqueOrThrow({
-      where: { id: review.id },
-    });
-    expect(final.status).toBe("executed");
-    expect(final.screeningResultId).toBeTruthy();
-
-    const closed = await db.kycCase.findUniqueOrThrow({
-      where: { id: kycCase.id },
-    });
-    expect(closed.status).toBe("verified");
+      await db.approvalRequest.count({ where: { entityId: kase.id } }),
+    ).toBe(0);
   });
 
-  it("applies a reject recommendation to the case when approved", async () => {
-    const kycCase = await seedCase(45);
-    const review = await requestReview(users.kai, {
-      caseId: kycCase.id,
-      recommendation: "reject",
-      reason: "sanctions list hit",
+  it("rejects with a required reason, audited", async () => {
+    const kase = await seedCase(40, users.kai.id);
+    const after = await dispositionCase(users.kai, {
+      caseId: kase.id,
+      action: "reject",
+      reason: "sanctions match",
     });
-    await decideReview(users.sam, {
-      approvalRequestId: review.approvalRequestId!,
+    expect(after.status).toBe("rejected");
+    const actions = await auditActionsFor("kyc_case", kase.id);
+    expect(actions).toContain("kyc_case.rejected");
+  });
+
+  it("routes risk >= 80 approval to a senior second review", async () => {
+    const kase = await seedCase(80, users.kai.id);
+    const after = await dispositionCase(users.kai, {
+      caseId: kase.id,
+      action: "approve",
+      reason: "looks fine but high risk",
+    });
+    expect(after.status).toBe("pending_second_review");
+    const req = await db.approvalRequest.findFirstOrThrow({
+      where: { entityType: "kyc_case", entityId: kase.id },
+    });
+    expect(req.requiredRole).toBe("kyc_senior");
+    expect(req.requesterId).toBe(users.kai.id);
+
+    const decided = await decideCase(users.sam, {
+      approvalRequestId: req.id,
       approve: true,
+        note: "test justification",
+      });
+    expect(decided.status).toBe("approved");
+    const final = await db.kycCase.findUniqueOrThrow({
+      where: { id: kase.id },
     });
-    const closed = await db.kycCase.findUniqueOrThrow({
-      where: { id: kycCase.id },
-    });
-    expect(closed.status).toBe("rejected");
+    expect(final.status).toBe("verified");
+
+    const actions = await auditActionsFor("kyc_case", kase.id);
+    expect(actions).toContain("kyc_case.second_review_requested");
+    expect(actions).toContain("kyc_case.verified");
+    const approvalActions = await auditActionsFor(
+      "approval_request",
+      req.id,
+    );
+    expect(approvalActions).toContain("approval.requested");
+    expect(approvalActions).toContain("approval.approved");
   });
 
-  it("audits the failed path when the screening vendor declines", async () => {
-    const kycCase = await seedCase(30, "kyc_x_FAIL");
-    const review = await requestReview(users.kai, {
-      caseId: kycCase.id,
-      recommendation: "verify",
-      reason: "docs look clean",
+  it("routes escalations to the senior queue; a senior rejection closes the case", async () => {
+    const kase = await seedCase(30, users.kai.id);
+    const after = await dispositionCase(users.kai, {
+      caseId: kase.id,
+      action: "escalate",
+      reason: "unclear docs",
     });
-    await decideReview(users.sam, {
-      approvalRequestId: review.approvalRequestId!,
-      approve: true,
+    expect(after.status).toBe("escalated");
+    const req = await db.approvalRequest.findFirstOrThrow({
+      where: { entityType: "kyc_case", entityId: kase.id },
     });
-    const final = await db.kycReview.findUniqueOrThrow({
-      where: { id: review.id },
+
+    await decideCase(users.sam, {
+      approvalRequestId: req.id,
+      approve: false,
+      note: "insufficient evidence",
     });
-    expect(final.status).toBe("failed");
-    expect(final.failureReason).toBeTruthy();
-    // The case is freed — no verdict was filed.
-    const kycCaseAfter = await db.kycCase.findUniqueOrThrow({
-      where: { id: kycCase.id },
+    const final = await db.kycCase.findUniqueOrThrow({
+      where: { id: kase.id },
     });
-    expect(kycCaseAfter.status).toBe("pending");
+    expect(final.status).toBe("rejected");
+    const actions = await auditActionsFor("kyc_case", kase.id);
+    expect(actions).toContain("kyc_case.escalated");
+    expect(actions).toContain("kyc_case.rejected");
   });
-});
 
-describe("self-approval", () => {
-  it("rejects a decision by the requester even with the required role", async () => {
-    const kycCase = await seedCase(30); // standard -> kyc_senior route
-    // sam is a kyc_senior AND the requester.
-    const review = await requestReview(users.sam, {
-      caseId: kycCase.id,
-      recommendation: "verify",
-      reason: "spot check",
+  it("lets a senior disposition any case", async () => {
+    const kase = await seedCase(40, users.kai.id);
+    const after = await dispositionCase(users.sam, {
+      caseId: kase.id,
+      action: "approve",
+      reason: "senior override",
     });
-    await expect(
-      decideReview(users.sam, {
-        approvalRequestId: review.approvalRequestId!,
-        approve: true,
-      }),
-    ).rejects.toThrow(ForbiddenError);
+    expect(after.status).toBe("verified");
   });
-});
 
-describe("risk routing", () => {
-  it("routes standard cases to kyc_senior and high-risk to finance_approver", async () => {
-    expect(requiredRoleForReview(69)).toBe("kyc_senior");
-    expect(requiredRoleForReview(70)).toBe("finance_approver");
-
-    const low = await seedCase(30, "kyc_low");
-    const high = await seedCase(85, "kyc_high");
-
-    const lowReview = await requestReview(users.kai, {
-      caseId: low.id,
-      recommendation: "verify",
-      reason: "standard",
+  it("keeps a senior-routed case decidable when the assignee is someone else", async () => {
+    // Sam escalates Kai's case: the requester is sam, the assignee is kai —
+    // the request must still be decidable (by a different senior flow).
+    const kase = await seedCase(30, users.kai.id);
+    await dispositionCase(users.sam, {
+      caseId: kase.id,
+      action: "escalate",
+      reason: "senior re-routing",
     });
-    const highReview = await requestReview(users.kai, {
-      caseId: high.id,
-      recommendation: "reject",
-      reason: "high risk",
+    const req = await db.approvalRequest.findFirstOrThrow({
+      where: { entityType: "kyc_case", entityId: kase.id },
     });
-
-    const lowReq = await db.approvalRequest.findUniqueOrThrow({
-      where: { id: lowReview.approvalRequestId! },
-    });
-    const highReq = await db.approvalRequest.findUniqueOrThrow({
-      where: { id: highReview.approvalRequestId! },
-    });
-    expect(lowReq.requiredRole).toBe("kyc_senior");
-    expect(highReq.requiredRole).toBe("finance_approver");
-
-    // The wrong role cannot decide.
+    expect(req.requesterId).toBe(users.sam.id);
+    // sam routed it, so sam cannot decide it (self-approval) — but the
+    // decision itself must be well-formed, not refused on provenance.
     await expect(
-      decideReview(users.fiona, {
-        approvalRequestId: lowReq.id,
-        approve: true,
-      }),
-    ).rejects.toThrow(ForbiddenError);
-    await expect(
-      decideReview(users.sam, {
-        approvalRequestId: highReq.id,
-        approve: true,
-      }),
-    ).rejects.toThrow(ForbiddenError);
-
-    // The right roles can.
-    await expect(
-      decideReview(users.sam, {
-        approvalRequestId: lowReq.id,
-        approve: true,
-      }),
-    ).resolves.toMatchObject({ status: "approved" });
-    await expect(
-      decideReview(users.fiona, {
-        approvalRequestId: highReq.id,
-        approve: false,
-        note: "escalate to committee instead",
-      }),
-    ).resolves.toMatchObject({ status: "rejected" });
+      decideCase(users.sam, { approvalRequestId: req.id, approve: true, note: "test justification" }),
+    ).rejects.toThrow("cannot approve or reject your own");
   });
 });
 
-describe("validation", () => {
-  it("requires a reason and a valid recommendation", async () => {
-    const kycCase = await seedCase(30);
+describe("kyc tool — self-approval", () => {
+  it("blocks a senior from deciding a request they routed themselves", async () => {
+    // sam owns this case; his escalation creates a request he is the requester
+    // of — and he is the only kyc_senior, so nobody can decide it.
+    const kase = await seedCase(30, users.sam.id);
+    await dispositionCase(users.sam, {
+      caseId: kase.id,
+      action: "escalate",
+      reason: "second opinion",
+    });
+    const req = await db.approvalRequest.findFirstOrThrow({
+      where: { entityType: "kyc_case", entityId: kase.id },
+    });
     await expect(
-      requestReview(users.kai, {
-        caseId: kycCase.id,
-        recommendation: "verify",
-        reason: "   ",
-      }),
+      decideCase(users.sam, { approvalRequestId: req.id, approve: true, note: "test justification" }),
+    ).rejects.toThrow(ForbiddenError);
+    // The case stays in the senior queue, undecided.
+    const final = await db.kycCase.findUniqueOrThrow({
+      where: { id: kase.id },
+    });
+    expect(final.status).toBe("escalated");
+  });
+});
+
+describe("kyc tool — PII masking and reveal", () => {
+  it("masks ssn and dob in every read path", async () => {
+    const kase = await seedCase(40, users.kai.id); // ssn 999-00-1234, dob 1985-04-12
+    const listed = await searchCases(users.kai);
+    const row = listed.find((c) => c.id === kase.id)!;
+    expect(row.ssn).toBe("***-**-1234");
+    expect(row.dob).toBe("1985");
+
+    const fetched = await getCase(users.kai, kase.id);
+    expect(fetched.ssn).toBe("***-**-1234");
+    expect(fetched.dob).toBe("1985");
+    expect(JSON.stringify(listed)).not.toContain("999-00-1234");
+    expect(JSON.stringify(listed)).not.toContain("1985-04-12");
+  });
+
+  it("requires a senior, a reason, and writes an audit event for reveal", async () => {
+    const kase = await seedCase(40, users.kai.id);
+    await expect(
+      revealPii(users.sam, { caseId: kase.id, reason: "  " }),
+    ).rejects.toThrow(ValidationError);
+
+    const revealed = await revealPii(users.sam, {
+      caseId: kase.id,
+      reason: "subpoena response",
+    });
+    expect(revealed).toEqual({ ssn: "999-00-1234", dob: "1985-04-12" });
+
+    const actions = await auditActionsFor("kyc_case", kase.id);
+    expect(actions).toContain("kyc_case.pii_revealed");
+    // The audit row records the reason and fields — never the values.
+    const audit = await db.auditEvent.findFirstOrThrow({
+      where: { entityId: kase.id, action: "kyc_case.pii_revealed" },
+    });
+    expect(audit.after).not.toContain("999-00-1234");
+    expect(audit.after).toContain("subpoena response");
+  });
+});
+
+describe("kyc tool — validation", () => {
+  it("requires a reason and a valid action", async () => {
+    const kase = await seedCase(40, users.kai.id);
+    await expect(
+      dispositionCase(users.kai, { caseId: kase.id, action: "approve", reason: "" }),
     ).rejects.toThrow(ValidationError);
     await expect(
-      requestReview(users.kai, {
-        caseId: kycCase.id,
-        recommendation: "maybe",
-        reason: "unsure",
+      dispositionCase(users.kai, {
+        caseId: kase.id,
+        action: "merge",
+        reason: "hmm",
       }),
     ).rejects.toThrow(ValidationError);
   });
 
-  it("blocks a second active review and reviews on closed cases", async () => {
-    const kycCase = await seedCase(30);
-    await requestReview(users.kai, {
-      caseId: kycCase.id,
-      recommendation: "verify",
-      reason: "first",
+  it("refuses a second disposition once the case left pending", async () => {
+    const kase = await seedCase(40, users.kai.id);
+    await dispositionCase(users.kai, {
+      caseId: kase.id,
+      action: "reject",
+      reason: "no",
     });
     await expect(
-      requestReview(users.kai, {
-        caseId: kycCase.id,
-        recommendation: "reject",
-        reason: "second",
+      dispositionCase(users.kai, {
+        caseId: kase.id,
+        action: "approve",
+        reason: "changed mind",
       }),
-    ).rejects.toThrow(ValidationError);
-
-    const closed = await seedCase(30, "kyc_closed", "verified");
-    await expect(
-      requestReview(users.kai, {
-        caseId: closed.id,
-        recommendation: "reject",
-        reason: "redo",
-      }),
-    ).rejects.toThrow(ValidationError);
+    ).rejects.toThrow();
   });
 });

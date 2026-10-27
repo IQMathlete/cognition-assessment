@@ -17,31 +17,44 @@ export default async function KycRequestsPage() {
     );
   }
 
-  // The pending queue requires kyc:approve; readers without it still see
+  // The senior queue requires kyc:approve; readers without it still see
   // the full request history below.
   const canDecide = hasPermission(user.role, "kyc:approve");
   const [queue, all] = await Promise.all([
     canDecide
-      ? listPendingApprovalsFor(user, "kyc:approve", "kyc_review")
+      ? listPendingApprovalsFor(user, "kyc:approve", "kyc_case")
       : Promise.resolve([]),
     listApprovals(),
   ]);
-  const kycRequests = all.filter((r) => r.entityType === "kyc_review");
+  // A reviewer only sees requests they routed; the senior sees all of them.
+  // listApprovals returns every request — scoping here keeps the assigned-
+  // case boundary from leaking other reviewers' cases through the history.
+  const kycRequests = all.filter(
+    (r) => r.entityType === "kyc_case" && (canDecide || r.requesterId === user.id),
+  );
 
-  // Attach review + case context to each request row.
-  const reviews = await db.kycReview.findMany({
+  // Attach case context to each request row — no PII is selected here; the
+  // queue only needs the routing context (case id, applicant, risk).
+  const cases = await db.kycCase.findMany({
     where: { approvalRequestId: { in: kycRequests.map((a) => a.id) } },
-    include: { case: true },
+    select: {
+      approvalRequestId: true,
+      externalId: true,
+      applicant: true,
+      riskScore: true,
+      status: true,
+    },
   });
-  const reviewByApprovalId = new Map(
-    reviews.map((r) => [r.approvalRequestId, r]),
+  const caseByApprovalId = new Map(
+    cases.map((c) => [c.approvalRequestId, c]),
   );
 
   return (
     <>
-      <h1>Approval queue</h1>
+      <h1>Senior queue</h1>
       <p className="subtle">
-        Pending KYC requests routed to <strong>{user.role}</strong>.
+        Escalated cases and second reviews waiting on{" "}
+        <strong>{user.role}</strong>.
       </p>
 
       <h2>Waiting on you</h2>
@@ -49,29 +62,25 @@ export default async function KycRequestsPage() {
         <p className="subtle">Nothing pending for your role.</p>
       ) : (
         queue.map((req) => {
-          const review = reviewByApprovalId.get(req.id);
+          const kycCase = caseByApprovalId.get(req.id);
           return (
             <div className="panel" key={req.id}>
-              <div className="row" style={{ justifyContent: "space-between" }}>
-                <div>
-                  <div>
-                    <strong>{req.entityType}</strong>{" "}
-                    <span className="mono">{req.entityId.slice(0, 8)}…</span>
-                    {review && (
-                      <>
-                        {" — "}
-                        {review.recommendation} on{" "}
-                        <span className="mono">
-                          {review.case.externalId}
-                        </span>{" "}
-                        ({review.case.applicant}, risk {review.case.riskScore})
-                      </>
-                    )}
-                  </div>
-                  <div className="subtle" style={{ marginTop: 4 }}>
-                    Requested by {req.requester.username} · Reason: {req.reason}
-                  </div>
-                </div>
+              <div>
+                <strong>{req.entityType}</strong>{" "}
+                <span className="mono">{req.entityId.slice(0, 8)}…</span>
+                {kycCase && (
+                  <>
+                    {" — "}
+                    <span className="mono">{kycCase.externalId}</span> (
+                    {kycCase.applicant}, risk {kycCase.riskScore}) —{" "}
+                    <span className={`badge ${kycCase.status}`}>
+                      {kycCase.status}
+                    </span>
+                  </>
+                )}
+              </div>
+              <div className="subtle" style={{ marginTop: 4 }}>
+                Routed by {req.requester.username} · Reason: {req.reason}
               </div>
               {canDecide && req.requesterId !== user.id ? (
                 <DecisionForm approvalRequestId={req.id} />
@@ -92,7 +101,7 @@ export default async function KycRequestsPage() {
         <thead>
           <tr>
             <th>Entity</th>
-            <th>Requester</th>
+            <th>Routed by</th>
             <th>Required role</th>
             <th>Status</th>
             <th>Decided by</th>
@@ -123,7 +132,7 @@ export default async function KycRequestsPage() {
           {kycRequests.length === 0 && (
             <tr>
               <td colSpan={5} className="subtle">
-                No review requests yet.
+                No requests yet.
               </td>
             </tr>
           )}
