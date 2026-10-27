@@ -28,11 +28,11 @@ export const toolRegistry: ToolRegistration[] = [
     slug: "kyc",
     name: "KYC Review",
     path: "/tools/kyc",
-    owner: "Compliance Operations",
+    owner: "sam",
     sensitivity: "high",
     requiredPermission: "kyc:read",
     description:
-      "Submit applicant cases for KYC verdicts, subject to senior or financial-crimes approval.",
+      "Review assigned KYC cases: approve, reject, or escalate. High-risk cases get a second senior review.",
   },
 ];
 

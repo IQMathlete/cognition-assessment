@@ -1,11 +1,11 @@
 "use client";
 
 import { useActionState } from "react";
-import { decideReviewAction, type FormState } from "@/tools/kyc/actions";
+import { decideCaseAction, type FormState } from "@/tools/kyc/actions";
 
 export function DecisionForm({ approvalRequestId }: { approvalRequestId: string }) {
   const [state, formAction, pending] = useActionState<FormState, FormData>(
-    decideReviewAction,
+    decideCaseAction,
     {},
   );
 

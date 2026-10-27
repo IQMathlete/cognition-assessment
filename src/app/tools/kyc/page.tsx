@@ -1,7 +1,9 @@
 import Link from "next/link";
 import { requireUser } from "@/platform/auth";
 import { hasPermission } from "@/platform/rbac";
-import { listReviews, searchCases } from "@/tools/kyc";
+import { searchCases } from "@/tools/kyc";
+import { DispositionForm } from "./disposition";
+import { RevealForm } from "./reveal";
 
 export const dynamic = "force-dynamic";
 
@@ -15,24 +17,25 @@ export default async function KycPage({
     return (
       <div className="panel">
         <h1>Access denied</h1>
-        <p className="subtle">Your role cannot open the KYC Review tool.</p>
+        <p className="subtle">Your role cannot open the KYC queue.</p>
       </div>
     );
   }
 
   const { q } = await searchParams;
-  const [cases, reviews] = await Promise.all([
-    searchCases(user, q),
-    listReviews(user),
-  ]);
-  const canRequest = hasPermission(user.role, "kyc:create");
+  const cases = await searchCases(user, q);
+  const canDisposition = hasPermission(user.role, "kyc:review");
+  const canReveal = hasPermission(user.role, "kyc:reveal");
+  const seesAll = hasPermission(user.role, "kyc:approve");
 
   return (
     <>
       <h1>KYC Review</h1>
       <p className="subtle">
-        Pending applicant cases.{" "}
-        <Link href="/tools/kyc/requests">Go to approval queue →</Link>
+        {seesAll
+          ? "All applicant cases."
+          : "Cases assigned to you."}{" "}
+        <Link href="/tools/kyc/requests">Go to senior queue →</Link>
       </p>
 
       <div className="panel">
@@ -53,9 +56,13 @@ export default async function KycPage({
           <tr>
             <th>Case</th>
             <th>Applicant</th>
+            <th>SSN</th>
+            <th>DOB</th>
             <th>Country</th>
-            <th>Risk score</th>
+            <th>Risk</th>
+            <th>Documents</th>
             <th>Status</th>
+            {seesAll && <th>Assignee</th>}
             <th></th>
           </tr>
         </thead>
@@ -64,65 +71,37 @@ export default async function KycPage({
             <tr key={c.id}>
               <td className="mono">{c.externalId}</td>
               <td>{c.applicant}</td>
+              <td className="mono">{c.ssn}</td>
+              <td className="mono">{c.dob}</td>
               <td>{c.country}</td>
-              <td>{c.riskScore}</td>
+              <td>
+                {c.riskScore}
+                {c.riskScore >= 80 && (
+                  <span
+                    className="badge pending_second_review"
+                    style={{ marginLeft: 6 }}
+                  >
+                    2nd review
+                  </span>
+                )}
+              </td>
+              <td className="subtle">{c.documents}</td>
               <td>
                 <span className={`badge ${c.status}`}>{c.status}</span>
               </td>
+              {seesAll && <td>{c.assignee.username}</td>}
               <td>
-                {canRequest && c.status === "pending" ? (
-                  <Link
-                    className="btn secondary"
-                    href={`/tools/kyc/new?case=${c.id}`}
-                  >
-                    Request review
-                  </Link>
+                {canDisposition && c.status === "pending" ? (
+                  <DispositionForm caseId={c.id} />
                 ) : null}
+                {canReveal ? <RevealForm caseId={c.id} /> : null}
               </td>
             </tr>
           ))}
           {cases.length === 0 && (
             <tr>
-              <td colSpan={6} className="subtle">
+              <td colSpan={seesAll ? 10 : 9} className="subtle">
                 No cases match.
-              </td>
-            </tr>
-          )}
-        </tbody>
-      </table>
-
-      <h2>Review requests</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Case</th>
-            <th>Recommendation</th>
-            <th>Requested by</th>
-            <th>Reason</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {reviews.map((r) => (
-            <tr key={r.id}>
-              <td className="mono">{r.case.externalId}</td>
-              <td>{r.recommendation}</td>
-              <td>{r.requestedBy.username}</td>
-              <td>{r.reason}</td>
-              <td>
-                <span className={`badge ${r.status}`}>{r.status}</span>
-                {r.failureReason ? (
-                  <div className="subtle" style={{ fontSize: 12 }}>
-                    {r.failureReason}
-                  </div>
-                ) : null}
-              </td>
-            </tr>
-          ))}
-          {reviews.length === 0 && (
-            <tr>
-              <td colSpan={5} className="subtle">
-                No review requests yet.
               </td>
             </tr>
           )}

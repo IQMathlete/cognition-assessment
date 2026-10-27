@@ -9,6 +9,8 @@ Next.js (App Router) + TypeScript + Prisma + SQLite.
 ```bash
 npm install        # also runs `prisma generate`
 npm run seed       # creates prisma/dev.db and loads users + transactions
+# If the schema changed since your dev.db was created, reset it first:
+# npx prisma db push --force-reset && npm run seed
 npm run dev        # http://localhost:3000
 npm test           # vitest
 npm run build      # production build
@@ -72,13 +74,17 @@ src/app/               App Router pages (login, /, /admin, /tools/*)
 
 ## KYC Review tool
 
-- `kyc_reviewer` searches applicant cases and requests a review with a
-  recommendation (`verify`/`reject`) and a required reason.
-- Risk score < 70 → `kyc_senior` approves; ≥ 70 → `finance_approver`
-  (standing in for a financial-crimes committee).
-- On approval a `ScreeningClient` (`src/tools/kyc/screening.ts`,
-  `MockScreeningClient` by default) files the verdict; statuses flow
-  `requested → approved/rejected → executed/failed`, and an executed verdict
-  updates the case (`pending → verified/rejected`) in the same transaction.
-  Cases whose `externalId` ends in `FAIL` are declined by the mock vendor.
-  A case can only have one active review at a time.
+- `kyc_reviewer` sees only the cases assigned to them (`assigneeId`); a
+  `kyc_senior` sees the whole queue.
+- On a pending case the reviewer dispositions it — **approve**, **reject**,
+  or **escalate** — with a required reason. Approving a case with risk score
+  ≥ 80, or escalating any case, routes it to the senior queue via the shared
+  approvals primitive (`kyc_senior` decides); low-risk approvals verify
+  immediately.
+- PII (`ssn`, `dob`) is masked server-side in every read (`***-**-1234`,
+  birth year only). `kyc_senior` can reveal the values via `revealPii`,
+  which requires a reason and writes a `kyc_case.pii_revealed` audit event
+  recording the reason and the fields revealed — never the values.
+- Statuses flow `pending → verified/rejected` directly, or
+  `pending → escalated/pending_second_review → verified/rejected` through
+  the senior queue. Every transition is audited.
