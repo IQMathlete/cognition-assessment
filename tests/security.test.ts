@@ -92,7 +92,8 @@ describe("over-refund", () => {
     await decideRefund(users.bob, {
       approvalRequestId: a.approval.id,
       approve: true,
-    });
+        note: "test justification",
+      });
     expect(
       (await db.refund.findUniqueOrThrow({ where: { id: a.refund.id } })).status,
     ).toBe("executed");
@@ -102,7 +103,8 @@ describe("over-refund", () => {
     await decideRefund(users.bob, {
       approvalRequestId: b.approval.id,
       approve: true,
-    });
+        note: "test justification",
+      });
     const bFinal = await db.refund.findUniqueOrThrow({
       where: { id: b.refund.id },
     });
@@ -157,6 +159,7 @@ describe("transaction + state-machine guards", () => {
       decideRefund(users.bob, {
         approvalRequestId: approval.id,
         approve: true,
+        note: "test justification",
       }),
     ).rejects.toThrow();
     expect(
@@ -203,20 +206,77 @@ describe("approval queue access", () => {
         requestId: refund.approvalRequestId!,
         decider: null,
         approve: true,
+        note: "test justification",
       }),
     ).rejects.toThrow(ForbiddenError);
 
     await decideRefund(users.bob, {
       approvalRequestId: refund.approvalRequestId!,
       approve: false,
-    });
+        note: "test justification",
+      });
     // Re-deciding is rejected — no replay.
     await expect(
       decideRefund(users.fiona, {
         approvalRequestId: refund.approvalRequestId!,
         approve: true,
+        note: "test justification",
       }),
     ).rejects.toThrow();
+  });
+});
+
+describe("mandatory decision justification", () => {
+  it("rejects decisions with no or too-short justification, audited", async () => {
+    const txn = await seedTransaction(10000, "txn_just");
+    const refund = await requestRefund(users.alice, {
+      transactionId: txn.id,
+      amountCents: 5000,
+      reason: "x",
+    });
+    await expect(
+      decideRefund(users.bob, {
+        approvalRequestId: refund.approvalRequestId!,
+        approve: true,
+        note: "short",
+      }),
+    ).rejects.toThrow(ValidationError);
+    await expect(
+      decideRefund(users.bob, {
+        approvalRequestId: refund.approvalRequestId!,
+        approve: true,
+      }),
+    ).rejects.toThrow(ValidationError);
+    // Nothing committed — the request stays pending and the attempt is audited.
+    expect(
+      (await db.approvalRequest.findUniqueOrThrow({
+        where: { id: refund.approvalRequestId! },
+      })).status,
+    ).toBe("pending");
+    const actions = (await db.auditEvent.findMany()).map((e) => e.action);
+    expect(actions).toContain("approval.decide_failed");
+  });
+
+  it("records the justification on the request and in the audit row", async () => {
+    const txn = await seedTransaction(10000, "txn_just2");
+    const refund = await requestRefund(users.alice, {
+      transactionId: txn.id,
+      amountCents: 5000,
+      reason: "x",
+    });
+    await decideRefund(users.bob, {
+      approvalRequestId: refund.approvalRequestId!,
+      approve: false,
+      note: "  does not meet policy  ",
+    });
+    const req = await db.approvalRequest.findUniqueOrThrow({
+      where: { id: refund.approvalRequestId! },
+    });
+    expect(req.decisionNote).toBe("does not meet policy"); // trimmed
+    const audit = await db.auditEvent.findFirstOrThrow({
+      where: { entityId: req.id, action: "approval.rejected" },
+    });
+    expect(audit.after).toContain("does not meet policy");
   });
 });
 
