@@ -73,6 +73,8 @@ export async function createApprovalRequest(
   return request;
 }
 
+export const MIN_JUSTIFICATION_LENGTH = 10;
+
 export async function decideApproval(input: {
   requestId: string;
   decider: { id: string; role: string } | null;
@@ -114,6 +116,15 @@ export async function decideApproval(input: {
         );
       }
 
+      // Compliance: every decision requires a free-text justification,
+      // recorded on the request and carried into the decision's audit row.
+      const justification = note?.trim() ?? "";
+      if (justification.length < MIN_JUSTIFICATION_LENGTH) {
+        throw new ValidationError(
+          `A justification of at least ${MIN_JUSTIFICATION_LENGTH} characters is required for every decision.`,
+        );
+      }
+
       const toolHooks = hooks.get(request.entityType);
       if (!toolHooks) {
         throw new NotFoundError(
@@ -136,7 +147,7 @@ export async function decideApproval(input: {
         data: {
           status,
           decidedById: deciderRow.id,
-          decisionNote: note ?? null,
+          decisionNote: justification,
           decidedAt: new Date(),
         },
       });

@@ -120,11 +120,13 @@ describe("cumulative limits / over-refund", () => {
     await decideRefund(users.bob, {
       approvalRequestId: r1.approvalRequestId!,
       approve: true,
-    });
+        note: "test justification",
+      });
     if (r2) {
       await decideRefund(users.bob, {
         approvalRequestId: r2.approvalRequestId!,
         approve: true,
+        note: "test justification",
       });
     }
 
@@ -169,11 +171,13 @@ describe("decision replay and double execution", () => {
     await decideRefund(users.bob, {
       approvalRequestId: refund.approvalRequestId!,
       approve: true,
-    });
+        note: "test justification",
+      });
     await expect(
       decideRefund(users.bob, {
         approvalRequestId: refund.approvalRequestId!,
         approve: false,
+        note: "test justification",
       }),
     ).rejects.toThrow();
     expect(await refundStatus(refund.id)).toBe("executed");
@@ -190,10 +194,12 @@ describe("decision replay and double execution", () => {
       decideRefund(users.bob, {
         approvalRequestId: refund.approvalRequestId!,
         approve: true,
+        note: "test justification",
       }),
       decideRefund(users.bob, {
         approvalRequestId: refund.approvalRequestId!,
         approve: true,
+        note: "test justification",
       }),
     ]);
     const won = results.filter((r) => r.status === "fulfilled");
@@ -212,7 +218,8 @@ describe("decision replay and double execution", () => {
     await decideRefund(users.bob, {
       approvalRequestId: refund.approvalRequestId!,
       approve: true,
-    });
+        note: "test justification",
+      });
     expect(payments.calls).toHaveLength(1);
 
     // Invoking the hook again must not issue a second payment.
@@ -250,7 +257,9 @@ describe("role spoofing and confused deputy", () => {
     await expect(
       decideApproval({
         requestId: refund.approvalRequestId!,
-        decider: { id: users.kai.id, role: "support_lead" },
+        decider: { id: users.kai.id, role: "support_lead",
+        note: "test justification",
+      },
         approve: true,
       }),
     ).rejects.toThrow(ForbiddenError);
@@ -276,6 +285,7 @@ describe("role spoofing and confused deputy", () => {
         requestId: crafted.id,
         decider: asActor(users.kai),
         approve: true,
+        note: "test justification",
       }),
     ).rejects.toThrow(ForbiddenError);
     expect(await refundStatus(refund.id)).toBe("requested");
@@ -294,6 +304,7 @@ describe("role spoofing and confused deputy", () => {
         requestId: refund.approvalRequestId!,
         decider: asActor(users.bob),
         approve: true,
+        note: "test justification",
       }),
     ).rejects.toThrow(ForbiddenError);
   });
@@ -308,7 +319,9 @@ describe("role spoofing and confused deputy", () => {
     await expect(
       decideApproval({
         requestId: refund.approvalRequestId!,
-        decider: null as unknown as { id: string; role: string },
+        decider: null as unknown as { id: string; role: string,
+        note: "test justification",
+      },
         approve: true,
       }),
     ).rejects.toThrow(ForbiddenError);
@@ -325,7 +338,9 @@ describe("role spoofing and confused deputy", () => {
     await expect(
       decideApproval({
         requestId: refund.approvalRequestId!,
-        decider: { id: "ghost-user-id", role: "support_lead" },
+        decider: { id: "ghost-user-id", role: "support_lead",
+        note: "test justification",
+      },
         approve: true,
       }),
     ).rejects.toThrow(ForbiddenError);
@@ -351,7 +366,8 @@ describe("entity confusion and linkage", () => {
     await decideRefund(users.bob, {
       approvalRequestId: crafted.id,
       approve: true,
-    });
+        note: "test justification",
+      });
     // The refund's real approval request is still pending — it must not have
     // been executed by an unrelated decision.
     expect(await refundStatus(refund.id)).toBe("requested");
@@ -368,7 +384,8 @@ describe("entity confusion and linkage", () => {
     await decideRefund(users.bob, {
       approvalRequestId: refund.approvalRequestId!,
       approve: false,
-    });
+        note: "test justification",
+      });
     expect(await refundStatus(refund.id)).toBe("rejected");
 
     const crafted = await craftApproval({
@@ -381,6 +398,7 @@ describe("entity confusion and linkage", () => {
       decideRefund(users.bob, {
         approvalRequestId: crafted.id,
         approve: true,
+        note: "test justification",
       }),
     ).rejects.toThrow();
     expect(await refundStatus(refund.id)).toBe("rejected");
@@ -402,13 +420,15 @@ describe("entity confusion and linkage", () => {
     await decideRefund(users.bob, {
       approvalRequestId: refund.approvalRequestId!,
       approve: true,
-    });
+        note: "test justification",
+      });
     // The refund already executed — the crafted decision is rejected
     // in-transaction rather than recorded and refused.
     await expect(
       decideRefund(users.bob, {
         approvalRequestId: crafted.id,
         approve: true,
+        note: "test justification",
       }),
     ).rejects.toThrow();
     expect(payments.calls).toHaveLength(1);
@@ -421,7 +441,7 @@ describe("entity confusion and linkage", () => {
       entityId: "nonexistent-refund-id",
     });
     await expect(
-      decideRefund(users.bob, { approvalRequestId: crafted.id, approve: true }),
+      decideRefund(users.bob, { approvalRequestId: crafted.id, approve: true, note: "test justification" }),
     ).rejects.toThrow();
     // The decision must not be committed when the entity cannot be resolved.
     const req = await db.approvalRequest.findUniqueOrThrow({
@@ -438,7 +458,7 @@ describe("entity confusion and linkage", () => {
       entityId: users.erin.id,
     });
     await expect(
-      decideRefund(users.bob, { approvalRequestId: crafted.id, approve: true }),
+      decideRefund(users.bob, { approvalRequestId: crafted.id, approve: true, note: "test justification" }),
     ).rejects.toThrow(ValidationError);
   });
 });
@@ -468,7 +488,8 @@ describe("transaction and state-machine integrity", () => {
     await decideRefund(users.bob, {
       approvalRequestId: refund.approvalRequestId!,
       approve: true,
-    });
+        note: "test justification",
+      });
     expect(await refundStatus(refund.id)).not.toBe("executed");
     expect(payments.calls).toHaveLength(0);
   });
@@ -485,6 +506,7 @@ describe("transaction and state-machine integrity", () => {
       decideRefund(users.bob, {
         approvalRequestId: refund.approvalRequestId!,
         approve: true,
+        note: "test justification",
       }),
     ).rejects.toThrow();
     // Secure outcomes: refund marked failed, or request still pending so the
@@ -508,7 +530,8 @@ describe("transaction and state-machine integrity", () => {
     await decideRefund(users.bob, {
       approvalRequestId: refund.approvalRequestId!,
       approve: true,
-    });
+        note: "test justification",
+      });
     expect(await refundStatus(refund.id)).toBe("failed");
     const refundEvents = (await db.auditEvent.findMany({
       where: { entityType: "refund", entityId: refund.id },
@@ -616,7 +639,7 @@ describe("audit integrity", () => {
       entityId: "missing-refund",
     });
     await expect(
-      decideRefund(users.bob, { approvalRequestId: crafted.id, approve: true }),
+      decideRefund(users.bob, { approvalRequestId: crafted.id, approve: true, note: "test justification" }),
     ).rejects.toThrow();
     const actions = await auditActions();
     expect(

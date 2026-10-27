@@ -54,7 +54,7 @@ describe("kyc tool — RBAC", () => {
     // kai routed it, but cannot decide (no kyc:approve) — and couldn't anyway
     // because it is his own request.
     await expect(
-      decideCase(users.kai, { approvalRequestId: req.id, approve: true }),
+      decideCase(users.kai, { approvalRequestId: req.id, approve: true, note: "test justification" }),
     ).rejects.toThrow(ForbiddenError);
     await expect(
       revealPii(users.kai, { caseId: kase.id, reason: "check" }),
@@ -136,7 +136,8 @@ describe("kyc tool — dispositions and audit", () => {
     const decided = await decideCase(users.sam, {
       approvalRequestId: req.id,
       approve: true,
-    });
+        note: "test justification",
+      });
     expect(decided.status).toBe("approved");
     const final = await db.kycCase.findUniqueOrThrow({
       where: { id: kase.id },
@@ -206,7 +207,7 @@ describe("kyc tool — dispositions and audit", () => {
     // sam routed it, so sam cannot decide it (self-approval) — but the
     // decision itself must be well-formed, not refused on provenance.
     await expect(
-      decideCase(users.sam, { approvalRequestId: req.id, approve: true }),
+      decideCase(users.sam, { approvalRequestId: req.id, approve: true, note: "test justification" }),
     ).rejects.toThrow("cannot approve or reject your own");
   });
 });
@@ -225,7 +226,7 @@ describe("kyc tool — self-approval", () => {
       where: { entityType: "kyc_case", entityId: kase.id },
     });
     await expect(
-      decideCase(users.sam, { approvalRequestId: req.id, approve: true }),
+      decideCase(users.sam, { approvalRequestId: req.id, approve: true, note: "test justification" }),
     ).rejects.toThrow(ForbiddenError);
     // The case stays in the senior queue, undecided.
     const final = await db.kycCase.findUniqueOrThrow({
