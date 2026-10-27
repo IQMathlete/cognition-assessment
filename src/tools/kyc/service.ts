@@ -51,6 +51,12 @@ function masked<T extends { ssn: string; dob: string }>(row: T) {
   return { ...row, ssn: maskSsn(row.ssn), dob: maskDob(row.dob) };
 }
 
+// Audit snapshots of a case get the same masking — otherwise /admin's audit
+// log would hand unmasked PII to a platform_admin with no reveal reason.
+function auditedCase<T extends { ssn: string; dob: string }>(row: T) {
+  return masked(row);
+}
+
 // A kyc_reviewer only sees cases assigned to them; a kyc_senior sees the whole
 // queue. The check keys on stored permissions, not a role-name comparison.
 function caseScope(actor: { id: string; role: string }) {
@@ -154,8 +160,8 @@ export async function dispositionCase(
           action: "kyc_case.rejected",
           entityType: "kyc_case",
           entityId: before.id,
-          before,
-          after: { ...after, reason },
+          before: auditedCase(before),
+          after: { ...auditedCase(after), reason },
         },
       };
     }
@@ -171,8 +177,8 @@ export async function dispositionCase(
           action: "kyc_case.verified",
           entityType: "kyc_case",
           entityId: before.id,
-          before,
-          after: { ...after, reason },
+          before: auditedCase(before),
+          after: { ...auditedCase(after), reason },
         },
       };
     }
@@ -200,8 +206,8 @@ export async function dispositionCase(
             : "kyc_case.second_review_requested",
         entityType: "kyc_case",
         entityId: before.id,
-        before,
-        after: { ...after, reason },
+        before: auditedCase(before),
+        after: { ...auditedCase(after), reason },
       },
     };
   });
@@ -280,8 +286,8 @@ async function setCaseStatus(actorId: string, caseId: string, to: string) {
         action: `kyc_case.${to}`,
         entityType: "kyc_case",
         entityId: caseId,
-        before,
-        after,
+        before: auditedCase(before),
+        after: auditedCase(after),
       },
     };
   });
@@ -352,15 +358,15 @@ registerApprovalHooks("kyc_case", {
         "Approval request is not linked to this case.",
       );
     }
-    if (kycCase.assigneeId !== request.requesterId) {
-      throw new HookRefusalError(
-        "Approval requester does not match the case assignee.",
-      );
-    }
+    // The requester must be the actor who routed this case into the senior
+    // queue — which need not be the assignee (a senior may escalate or
+    // second-review another reviewer's case). Provenance is proven by the
+    // audited disposition row carrying the requester as its actor.
     const requestedAudit = await tx.auditEvent.findFirst({
       where: {
         entityType: "kyc_case",
         entityId: kycCase.id,
+        actorId: request.requesterId,
         action: { in: ["kyc_case.escalated", "kyc_case.second_review_requested"] },
       },
     });

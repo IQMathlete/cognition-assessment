@@ -26,7 +26,12 @@ export default async function KycRequestsPage() {
       : Promise.resolve([]),
     listApprovals(),
   ]);
-  const kycRequests = all.filter((r) => r.entityType === "kyc_case");
+  // A reviewer only sees requests they routed; the senior sees all of them.
+  // listApprovals returns every request — scoping here keeps the assigned-
+  // case boundary from leaking other reviewers' cases through the history.
+  const kycRequests = all.filter(
+    (r) => r.entityType === "kyc_case" && (canDecide || r.requesterId === user.id),
+  );
 
   // Attach case context to each request row — no PII is selected here; the
   // queue only needs the routing context (case id, applicant, risk).

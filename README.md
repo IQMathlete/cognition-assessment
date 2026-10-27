@@ -9,6 +9,8 @@ Next.js (App Router) + TypeScript + Prisma + SQLite.
 ```bash
 npm install        # also runs `prisma generate`
 npm run seed       # creates prisma/dev.db and loads users + transactions
+# If the schema changed since your dev.db was created, reset it first:
+# npx prisma db push --force-reset && npm run seed
 npm run dev        # http://localhost:3000
 npm test           # vitest
 npm run build      # production build
