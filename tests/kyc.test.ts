@@ -189,6 +189,26 @@ describe("kyc tool — dispositions and audit", () => {
     });
     expect(after.status).toBe("verified");
   });
+
+  it("keeps a senior-routed case decidable when the assignee is someone else", async () => {
+    // Sam escalates Kai's case: the requester is sam, the assignee is kai —
+    // the request must still be decidable (by a different senior flow).
+    const kase = await seedCase(30, users.kai.id);
+    await dispositionCase(users.sam, {
+      caseId: kase.id,
+      action: "escalate",
+      reason: "senior re-routing",
+    });
+    const req = await db.approvalRequest.findFirstOrThrow({
+      where: { entityType: "kyc_case", entityId: kase.id },
+    });
+    expect(req.requesterId).toBe(users.sam.id);
+    // sam routed it, so sam cannot decide it (self-approval) — but the
+    // decision itself must be well-formed, not refused on provenance.
+    await expect(
+      decideCase(users.sam, { approvalRequestId: req.id, approve: true }),
+    ).rejects.toThrow("cannot approve or reject your own");
+  });
 });
 
 describe("kyc tool — self-approval", () => {
