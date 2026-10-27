@@ -129,3 +129,47 @@ src/app/               App Router pages (login, /, /admin, /tools/*)
 - Statuses flow `pending → verified/rejected` directly, or
   `pending → escalated/pending_second_review → verified/rejected` through
   the senior queue. Every transition is audited.
+
+## Building a new internal tool
+
+A new tool is a recipe, not a redesign — the platform supplies auth, RBAC,
+audit, and approvals; the tool supplies a data model, a permission set, a
+status machine, and a queue. The build-internal-tool skill codifies this
+scaffold:
+
+1. **Model** — add the entity to `prisma/schema.prisma` (requester,
+   assignee, status, whatever the tool decides), `npx prisma db push`,
+   extend `npm run seed` with synthetic rows and users.
+2. **Permissions** — add `<tool>:read` / `:create` / `:approve` to
+   `Permission` in `src/platform/rbac.ts` and grant them to roles (existing
+   or new).
+3. **Service** — `src/tools/<tool>/service.ts`: a status-transition table,
+   `requirePermission()` on every entry point, `resolveActor()` for the
+   caller, `withAudit()` around every mutation, and
+   `createApprovalRequest()` + `registerApprovalHooks()` wherever work
+   needs sign-off.
+4. **Actions + pages** — thin server actions in
+   `src/tools/<tool>/actions.ts`; pages under `src/app/tools/<tool>/`. The
+   requester's queue filters by assignee/requester; the approver's queue
+   reads `listPendingApprovalsFor`.
+5. **Register** — one `toolRegistry` entry (slug, name, owner, sensitivity,
+   requiredPermission) puts it in the sidebar and the `/admin` inventory.
+6. **Tests** — the AGENTS.md definition of done: unauthorized role rejected
+   server-side, every mutation audited, no self-approval.
+
+### Example: a ticketing system
+
+The same skeleton is a ticket queue with sign-off built in:
+
+- `Ticket` model: title, body, `requesterId`, `assigneeId`, priority,
+  status (`open → triaged → in_progress → resolved/closed`).
+- Roles: reuse `support_agent` (files tickets) and `support_lead` (triages,
+  assigns, approves closures), or add dedicated `ticket_agent`/`ticket_lead`.
+- Queue: an agent sees only tickets where `assigneeId` is them; a lead sees
+  all — the same scoping the KYC tool uses.
+- Approvals: high-priority tickets route to the lead's approval queue
+  before work starts, or resolving requires lead sign-off — the same
+  `ApprovalRequest` primitive, justification requirement, and
+  self-approval guard.
+- Audit: every assignment, status change, and decision lands in the audit
+  log; `/admin` is the searchable ticket history for free.
