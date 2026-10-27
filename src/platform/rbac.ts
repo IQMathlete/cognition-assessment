@@ -19,22 +19,18 @@ export type Permission =
   | "refunds:create"
   | "refunds:approve"
   | "kyc:read"
-  | "kyc:create"
+  | "kyc:review"
   | "kyc:approve"
+  | "kyc:reveal"
   | "admin:access";
 
 const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
   support_agent: ["refunds:read", "refunds:create"],
   support_lead: ["refunds:read", "refunds:create", "refunds:approve"],
-  finance_approver: [
-    "refunds:read",
-    "refunds:approve",
-    "kyc:read",
-    "kyc:approve",
-  ],
+  finance_approver: ["refunds:read", "refunds:approve"],
   engineer: ["refunds:read"],
-  kyc_reviewer: ["kyc:read", "kyc:create"],
-  kyc_senior: ["kyc:read", "kyc:create", "kyc:approve"],
+  kyc_reviewer: ["kyc:read", "kyc:review"],
+  kyc_senior: ["kyc:read", "kyc:review", "kyc:approve", "kyc:reveal"],
   platform_admin: ["admin:access", "refunds:read", "kyc:read"],
 };
 

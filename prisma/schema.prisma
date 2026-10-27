@@ -18,7 +18,7 @@ model User {
   approvalRequests  ApprovalRequest[] @relation("ApprovalRequester")
   approvalDecisions ApprovalRequest[] @relation("ApprovalDecider")
   refunds           Refund[]          @relation("RefundRequester")
-  kycReviews        KycReview[]       @relation("KycReviewRequester")
+  kycCases          KycCase[]         @relation("KycCaseAssignee")
 }
 
 // Append-only by convention: platform code only ever creates or reads these
@@ -89,30 +89,19 @@ model Refund {
 }
 
 model KycCase {
-  id         String   @id @default(cuid())
-  externalId String   @unique
-  applicant  String
-  country    String
-  riskScore  Int // 0-100, from the upstream screening vendor
-  status     String   @default("pending") // pending -> verified/rejected
-  createdAt  DateTime @default(now())
-
-  reviews KycReview[]
-}
-
-model KycReview {
   id                String   @id @default(cuid())
-  caseId            String
-  recommendation    String // "verify" | "reject" — what the reviewer wants decided
-  reason            String
-  status            String   @default("requested") // requested -> approved/rejected -> executed/failed
-  requestedById     String
-  approvalRequestId String?  @unique
-  screeningResultId String?
-  failureReason     String?
+  externalId        String   @unique
+  applicant         String
+  ssn               String // synthetic — never a real SSN; masked server-side in reads
+  dob               String // synthetic date of birth "YYYY-MM-DD"; masked to year in reads
+  country           String
+  riskScore         Int // 0-100; >= SECOND_REVIEW_RISK needs a kyc_senior second review
+  documents         String // placeholder document list, e.g. "passport, utility bill"
+  status            String   @default("pending") // pending -> escalated/pending_second_review -> verified/rejected
+  assigneeId        String
+  approvalRequestId String?  @unique // linked senior-queue request (escalation or second review)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
-  case        KycCase @relation(fields: [caseId], references: [id])
-  requestedBy User    @relation("KycReviewRequester", fields: [requestedById], references: [id])
+  assignee User @relation("KycCaseAssignee", fields: [assigneeId], references: [id])
 }
