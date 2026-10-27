@@ -1,8 +1,16 @@
 # Internal Tools Platform
 
-A Power Apps–style internal tools platform for a fintech: one login, role-based
-access, audit logging, approval workflows, and an inventory of internal apps.
+An internal-tools platform for a fintech — the core of what Microsoft Power
+Apps provides, rebuilt as one app: a single login, role-based access control,
+audit logging, approval workflows, and an inventory of internal applications.
 Next.js (App Router) + TypeScript + Prisma + SQLite.
+
+Every tool on the platform shares the same governance core: permission checks
+are server-side, every mutation writes an audit event in the same transaction,
+and anything needing sign-off goes through the shared approvals primitive.
+The platform ships two governed tools: **Refunds** (payment-refund requests
+with amount-threshold approval routing) and **KYC Review** (assigned-case
+dispositions with a senior queue and PII masking).
 
 ## Getting started
 
@@ -16,30 +24,63 @@ npm test           # vitest
 npm run build      # production build
 ```
 
+Sign in at `/login` by picking a user — no passwords (see "Not
+production-ready").
+
 ## Seeded users
 
-| username | role |
-| --- | --- |
-| alice | support_agent |
-| bob | support_lead |
-| fiona | finance_approver |
-| erin | engineer |
-| eli | engineer |
-| kai | kyc_reviewer |
-| sam | kyc_senior |
-| adam | platform_admin |
+| username | role | can do |
+| --- | --- | --- |
+| alice | support_agent | Search transactions, request refunds (reason required) |
+| bob | support_lead | Alice's powers + approve refunds ≤ $250 |
+| fiona | finance_approver | Approve refunds > $250 |
+| erin, eli | engineer | Read-only access to the refunds tool |
+| kai | kyc_reviewer | See his assigned KYC cases; approve / reject / escalate with a reason |
+| sam | kyc_senior | See all KYC cases, decide the senior queue (escalations, ≥80-risk second reviews), reveal PII (reason required, audited) |
+| adam | platform_admin | `/admin` — tool inventory, searchable audit log, access-review table |
+
+## Demo script
+
+A five-step tour of the governance core:
+
+1. **Request + approve (standard flow).** Sign in as **alice** → Refunds →
+   pick a settled transaction ≤ $250 → request a refund with a reason. Sign
+   in as **bob** → Refunds → approval queue → approve it. The refund
+   executes via the mock payments client; the transaction list shows it
+   `executed`.
+2. **Threshold routing.** As **alice**, request a refund > $250 → it lands
+   in **fiona**'s queue (`finance_approver`), not bob's — bob's queue stays
+   empty.
+3. **Self-approval blocked.** Have **bob** request a refund on a ≤ $250
+   transaction (support_lead can request too) → his own approval queue
+   shows the request but the decision buttons are replaced with
+   "You cannot decide your own request"; submitting anyway fails
+   server-side.
+4. **PII masking + reveal.** Sign in as **kai** → KYC Review → SSN shows
+   `***-**-1234` and DOB a year only. Kai has no Reveal button. Sign in as
+   **sam** → Reveal PII with a reason → the row shows raw values and a
+   `kyc_case.pii_revealed` event is written to the audit log.
+5. **Audit log.** Sign in as **adam** → `/admin` → Audit log → search
+   `kyc_case` or `refund` and expand **before → after** — every mutation
+   from steps 1–4 is there, in order, append-only.
 
 ## Architecture
 
 ```
 src/platform/          Shared platform — tools never talk to the DB without it
-  auth/                AuthProvider interface + DevAuthProvider
+  auth/                AuthProvider interface + DevAuthProvider (login picker)
+  actor.ts             resolveActor() — caller identity resolved from the DB,
+                       not from the caller's claims
   rbac.ts              Roles/permissions in code; requirePermission() gate
-  audit.ts             withAudit() — writes AuditEvent in the same transaction
-  approvals.ts         ApprovalRequest primitive + per-tool decision hooks
+  audit.ts             withAudit()/recordAudit() — AuditEvent in the same tx;
+                       SQLite triggers make audit rows physically append-only
+  approvals.ts         ApprovalRequest primitive + per-tool decision hooks;
+                       decideApproval() enforces pending-status, required role,
+                       no self-approval, and a mandatory ≥10-char justification
   registry.ts          Tool inventory (owner, sensitivity, required permission)
-src/tools/refunds/     Reference tool: search transactions, request refunds
-src/tools/kyc/         KYC review queue (second governed tool)
+  db.ts                Prisma singleton + audit-guard trigger installation
+src/tools/refunds/     Reference governed tool
+src/tools/kyc/         KYC review queue
 src/app/               App Router pages (login, /, /admin, /tools/*)
 ```
 
